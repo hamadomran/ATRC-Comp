@@ -1,0 +1,7 @@
+numpy
+opencv-python-headless   # on the Pi; use opencv-python on the laptop
+pyyaml
+pyserial                 # Pi only
+pygame                   # operator laptop only
+pandas
+matplotlib

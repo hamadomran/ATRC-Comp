@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------
+# Run configuration. Every number marked (A) is an ASSUMPTION:
+# a starting value to calibrate from test runs (see the guide).
+# ---------------------------------------------------------------
+
+hub:
+  host: 127.0.0.1
+  car_port: 9000            # car <-> hub
+  op_port: 9001             # operator <-> hub
+
+# Network links on the car (Pi). Order = baseline preference order.
+links:
+  - name: wifi
+    id: 1
+    iface: lo
+    nominal_kbps: 20000     # (A) measure once with iperf3 near the AP
+    signal_unusable: -78    # (A) dBm; calibrate from logs
+  - name: lte
+    id: 2
+    iface: lo
+    nominal_kbps: 6000      # (A) measure once with iperf3
+    signal_unusable: 20     # (A) modem signal quality %
+
+esp32:
+  port: /dev/ttyUSB0        # check with `ls /dev/ttyUSB* /dev/ttyACM*`
+  baud: 115200
+
+cameras:
+  front: {device: 0}        # /dev/video0
+  rear:  {device: 2}        # /dev/video2  (check with `v4l2-ctl --list-devices`)
+
+# Video quality ladder (MJPEG). kbps values are (A) until measured with
+# tools/measure_ladder.py on YOUR cameras and scene.
+ladder:
+  - {name: PAUSED,  w: 0,   h: 0,   fps: 0,  q: 0,  kbps: 0}
+  - {name: TRICKLE, w: 320, h: 240, fps: 1,  q: 40, kbps: 15}
+  - {name: L2,      w: 320, h: 240, fps: 10, q: 50, kbps: 300}
+  - {name: L3,      w: 320, h: 240, fps: 20, q: 60, kbps: 700}
+  - {name: L4,      w: 640, h: 480, fps: 10, q: 55, kbps: 900}
+  - {name: L5,      w: 640, h: 480, fps: 20, q: 60, kbps: 2000}
+
+timing:
+  loop_hz: 10               # decision loop
+  hb_hz: 10                 # heartbeats per link (20 when PREPARE)
+  hb_timeout_ms: 300        # heartbeat counts as missed after this
+  cmd_hz: 20                # operator command rate
+
+# Fixed limits per traffic type (shared by baseline + proposed)
+limits:
+  cmd:   {max_rtt_ms: 150, max_loss: 0.05}   # 0.05 = one missed heartbeat in 2 s tolerated
+  video: {max_rtt_ms: 300, max_loss: 0.05}
+
+baseline:
+  bad_after: 3              # consecutive violating checks -> link bad (~300 ms)
+  good_after: 10            # consecutive good checks -> link good (~1 s)
+  cam_down_loss: 0.02       # camera steps down when data loss > 2%
+  cam_up_after_s: 2.0       # camera steps up after 2 s with no loss
+  cam_min_level: 2
+  cam_max_level: 5
+
+proposed:
+  headroom: 0.8             # use 80% of estimated capacity
+  # --- mode detection (A) ---
+  reverse_thr: -0.10
+  stopped_speed: 0.05
+  stopped_for_s: 2.0
+  precision_steer: 0.5
+  precision_speed: 0.4
+  mode_debounce_s: 0.3
+  # --- prediction (A) ---
+  trend_window_s: 2.0
+  trend_consistency: [5, 7] # >=5 of last 7 steps worsening
+  margin_base_s: 1.0
+  margin_per_speed_s: 1.0   # extra margin at full throttle
+  switch_cost_s: 0.3        # (A) measure: time to move a stream to 4G
+  hold_s: 3.0               # no moving back for 3 s after a switch
+  return_stable_s: 3.0      # preferred link must be usable this long
+  # --- graceful degradation ---
+  stale_cmd_ms: 200
+  cap_raise_after_s: 2.0
+  caps: {OK: 1.0, CAUTION: 0.6, DEGRADED: 0.3, UNAVAILABLE: 0.0}
+
+# Needs table: per mode, which streams matter, allowed levels
+# (lowest = minimum useful), and their limits in that mode.
+modes:
+  DRIVE:
+    front: {prio: 1, levels: [2, 3, 5], max_rtt_ms: 250, max_loss: 0.05}
+    rear:  {prio: 3, levels: [1]}
+  PRECISION:
+    front: {prio: 1, levels: [4, 5], max_rtt_ms: 300, max_loss: 0.05}
+    rear:  {prio: 2, levels: [2, 3]}
+  REVERSE:
+    rear:  {prio: 1, levels: [2, 3, 5], max_rtt_ms: 250, max_loss: 0.05}
+    front: {prio: 3, levels: [1]}
+  STOPPED:
+    front: {prio: 1, levels: [4, 5], max_rtt_ms: 600, max_loss: 0.10}
+    rear:  {prio: 2, levels: [2]}
+  HIDE:
+    front: {prio: 9, levels: [0]}
+    rear:  {prio: 9, levels: [0]}

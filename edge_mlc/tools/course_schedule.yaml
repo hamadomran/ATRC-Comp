@@ -1,0 +1,25 @@
+# Repeatable impairments, timed from the start of the scripted drive.
+# Times are ASSUMPTIONS: set them to when the car reaches each zone
+# (watch one replay run with a stopwatch).
+tail_s: 5
+events:
+  # Zone A - gradual fade of Wi-Fi (leaving coverage)
+  - {at: 10.0, iface: wlan0, netem: "delay 40ms 10ms loss 2%"}
+  - {at: 11.0, iface: wlan0, netem: "delay 80ms 20ms loss 5%"}
+  - {at: 12.0, iface: wlan0, netem: "delay 140ms 30ms loss 12%"}
+  - {at: 13.0, iface: wlan0, netem: "delay 220ms 40ms loss 30%"}
+  - {at: 14.0, iface: wlan0, netem: "loss 100%"}
+  - {at: 18.0, iface: wlan0, netem: "delay 5ms"}
+  # Zone B - sudden blockage, no warning
+  - {at: 28.0, iface: wlan0, netem: "loss 100%"}
+  - {at: 32.0, iface: wlan0, netem: "delay 5ms"}
+  # Zone D - reversing on a thin 4G link while Wi-Fi is gone
+  - {at: 40.0, iface: wlan0, netem: "loss 100%"}
+  - {at: 40.0, iface: usb0,  netem: "rate 2mbit delay 60ms"}
+  - {at: 52.0, iface: wlan0, netem: "delay 5ms"}
+  - {at: 52.0, iface: usb0,  netem: "delay 1ms"}
+  # Delay burst (stale-command test)
+  - {at: 58.0, iface: usb0,  netem: "delay 600ms"}
+  - {at: 58.0, iface: wlan0, netem: "delay 600ms"}
+  - {at: 61.0, iface: usb0,  netem: "delay 1ms"}
+  - {at: 61.0, iface: wlan0, netem: "delay 5ms"}
