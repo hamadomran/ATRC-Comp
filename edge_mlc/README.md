@@ -8,8 +8,8 @@ teleoperated THeMIS-class UGV with mesh radio, Starlink and 4G.
 
 Needs Python 3.10+ with numpy, pandas, matplotlib, pyyaml (`pip install -r requirements.txt`).
 
-    python3 sim/run_experiments.py            # all runs, ~20 min on 2 cores -> results/*.csv
-    python3 sim/run_experiments.py --seeds 3  # quick check (~3 min)
+    python3 sim/run_experiments.py            # all runs, ~40 min on 2 cores (~10 on 4) -> results/*.csv
+    python3 sim/run_experiments.py --seeds 3  # quick check (~6 min on 2 cores)
     python3 sim/plots.py                      # charts -> results/charts/
 
 What is real and what is simulated:
@@ -20,8 +20,17 @@ What is real and what is simulated:
   behaviour), packets, queues, the operator's commands and the car's failsafe (`sim/engine.py`).
 * Settings for the simulated vehicle: `config/sim_themis.yaml`.
 
+Handover headroom: `sim/oracles.py` has two oracle deciders that read the scenario's
+ground truth (not deployable). They are upper bounds: "Oracle: perfect link choice"
+knows which link will stay good for the next 0.5 s, "Oracle: every up link" sends the
+needed view on every link that is truly up. A handover method can only be judged
+against them. In the original five variants Starlink is usually the only link, so even
+the oracles gain little; the `overlap` and `overlap_harsh` variants add 4G along the
+whole route at cell-edge quality so the choice of link matters. Chart: `handover.png`.
+
 Files:
-    sim/scenario.py         mission script + link models + 5 harder variants
+    sim/scenario.py         mission script + link models + 7 harder variants
+    sim/oracles.py          ground-truth oracles (upper bounds for handover)
     sim/engine.py           discrete-event simulator + metrics
     sim/run_experiments.py  configs x variants x seeds -> results/runs.csv, summary.csv, capacity.csv, caps.csv
     sim/plots.py            charts

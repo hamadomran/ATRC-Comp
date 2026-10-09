@@ -17,6 +17,10 @@ Mission (240 s, THeMIS-class UGV leaving base on an evacuation/resupply run):
 Assumption (A): link conditions follow TIME along the route (as if replaying a
 recorded run). If a vehicle slows down it does not change what the links do;
 we measure the lost progress separately.
+
+Variants (VARIANTS below) make one thing harder each. "overlap" and
+"overlap_harsh" add 4G along the whole route at cell-edge quality, so more than
+one link is usable most of the time and the choice of link at a handover matters.
 """
 import numpy as np
 
@@ -30,11 +34,17 @@ VARIANTS = {
     "heavy_jamming":    {"jam_start": 122.0, "jam_out": (148.0, 162.0)},
     "no_lte":           {"lte": False},
     "fast_fade":        {"fade": (50.0, 60.0)},
+    # coverage overlaps: 4G along the whole route at cell-edge quality, so the
+    # choice of link matters for handovers (the other variants are mostly
+    # single-link once the radio fades)
+    "overlap":          {"lte_route": True},
+    "overlap_harsh":    {"lte_route": True, "ho_p_out": 0.8, "ho_out_s": (0.5, 2.5)},
 }
 DEFAULTS = {
     "ho_p_out": 0.35, "ho_out_s": (0.2, 1.2),     # (A) chance + length of an outage at a handover
     "jam_start": 130.0, "jam_out": (152.0, 158.0),
     "lte": True,
+    "lte_route": False,                           # 4G at cell edge along the whole route (A)
     "fade": (35.0, 65.0),                         # radio fade start/end (s)
     "crater_cap": 1500.0,                         # Starlink kbps in the crater (A)
 }
@@ -143,6 +153,12 @@ def build(variant="nominal", seed=0, overrides=None):
         q = np.where((t >= 80) & (t < 96), np.minimum(_ramp(t, 80, 83, 0, 55), _ramp(t, 93, 96, 55, 0)), q)
         q = np.where(t >= 215, _ramp(t, 215, 220, 0, 60), q)
         q = np.clip(q + _ar1(rng, n, 3.0, 2.0) * (q > 0), 0, 100)
+    if v["lte_route"]:
+        # (A) slow fades in and out of usability (quality 8-20 %), good near base
+        r2 = np.random.default_rng(seed + 77)     # own stream: other links unchanged
+        q = 30 + _ar1(r2, n, 14.0, 6.0) + 8 * np.sin(2 * np.pi * t / 45 + r2.uniform(0, 6))
+        q = np.where((t < 40) | (t >= 215), np.maximum(q, 60), q)
+        q = np.clip(q, 0, 100)
     out["lte"] = dict(
         up=q > 8, signal=q,
         loss=0.002 + 0.4 / (1 + np.exp((q - 15) / 3)),
