@@ -29,6 +29,8 @@ class Sim:
         self.cfg, self.dec = cfg, decider
         self.rng = np.random.default_rng(seed + 1000)
         self.truth = S.build(variant, seed, overrides)
+        if hasattr(decider, "attach_truth"):       # oracles only (sim/oracles.py)
+            decider.attach_truth(self.truth)
         self.links = [l["name"] for l in cfg["links"]]
         self.ladder = cfg["ladder"]
         self.now = 0.0

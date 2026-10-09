@@ -21,7 +21,8 @@ from sim.scenario import PHASES, build        # noqa: E402
 
 C = {"Baseline": "#8a8f98", "Baseline + duplicate video": "#c3b28f", "Proposed": "#1764c0",
      "Proposed - mission": "#9cc0ea", "Proposed - predict": "#6fa3de", "Proposed - degrade": "#3f83d1",
-     "Baseline (fast, 1 check)": "#b5b9bf", "Baseline (5 checks)": "#70757d", "Baseline (slow, 8 checks)": "#4c5057"}
+     "Baseline (fast, 1 check)": "#b5b9bf", "Baseline (5 checks)": "#70757d", "Baseline (slow, 8 checks)": "#4c5057",
+     "Oracle: perfect link choice": "#d9dde3", "Oracle: every up link": "#c4cad2"}
 LINKC = {"radio": "#5b8c5a", "starlink": "#7a5ea8", "lte": "#d08a3c"}
 plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False,
                      "axes.titleweight": "bold", "axes.titlesize": 11, "figure.dpi": 150})
@@ -85,6 +86,38 @@ def variants(S, out):
     plt.close(fig)
 
 
+def handover(S, out):
+    """Handover headroom: each config against the two oracles (upper bounds that
+    read ground truth), in the repo variants vs the overlapping-coverage ones."""
+    cfgs = ["Baseline", "Baseline + duplicate video", "Proposed - predict", "Proposed",
+            "Oracle: perfect link choice", "Oracle: every up link"]
+    groups = [("Repo variants (mostly one link at a time)",
+               ["nominal", "harsh_handovers", "heavy_jamming", "no_lte", "fast_fade"]),
+              ("Overlapping coverage (4G along the route)", ["overlap", "overlap_harsh"])]
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4.2), sharey=True)
+    for ax, (title, vs) in zip(axs, groups):
+        d = S[S.variant.isin(vs)].groupby("config")[["interruptions", "dup_overhead_pct"]].mean().loc[cfgs]
+        y = np.arange(len(cfgs))
+        ax.barh(y, d.interruptions, color=[C[c] for c in cfgs],
+                edgecolor=["#555" if c.startswith("Oracle") else "none" for c in cfgs],
+                hatch=None, linestyle="--", height=0.65)
+        for i, (v, o) in enumerate(zip(d.interruptions, d.dup_overhead_pct)):
+            ax.text(v + 0.2, i, f"{v:.1f}" + (f"  (+{o:.0f}% data)" if o >= 1 else ""), va="center", fontsize=8.5)
+        ax.set_yticks(y)
+        ax.set_yticklabels([c.replace("Proposed - predict", "Proposed without prediction") for c in cfgs])
+        ax.invert_yaxis()
+        ax.set_xlabel("View interruptions per mission (lower is better)")
+        ax.set_title(title, loc="left")
+        ax.set_xlim(0, d.interruptions.max() * 1.45)
+    fig.suptitle("How much could a better handover gain? (oracles read ground truth)", x=0.01, ha="left",
+                 fontsize=12, fontweight="bold")
+    fig.text(0.01, 0.005, "Mean of 20 runs per variant. Oracles are upper bounds, not deployable.",
+             fontsize=8, color="#555")
+    fig.tight_layout(rect=(0, 0.03, 1, 0.94))
+    fig.savefig(os.path.join(out, "handover.png"))
+    plt.close(fig)
+
+
 def capacity(Cp, out):
     fig, ax = plt.subplots(figsize=(6.5, 3.8))
     for c in ["Baseline", "Proposed - mission", "Proposed"]:
@@ -107,7 +140,7 @@ def capacity(Cp, out):
 
 
 def cost(S, out):
-    nom = S[S.variant == "nominal"]
+    nom = S[(S.variant == "nominal") & ~S.config.str.startswith("Oracle")]   # oracles: see handover.png
     fig, ax = plt.subplots(figsize=(6.5, 4))
     for _, r in nom.iterrows():
         ax.errorbar(r.dup_overhead_pct, r.interruptions, xerr=r.dup_overhead_pct_ci, yerr=r.interruptions_ci,
@@ -231,6 +264,7 @@ def main():
     headline(S, a.out, ["Proposed", "Proposed - mission", "Proposed - predict", "Proposed - degrade"],
              "ablation.png", "What each feature contributes (one switched off at a time)")
     variants(S, a.out)
+    handover(S, a.out)
     capacity(Cp, a.out)
     cost(S, a.out)
     phases(S, a.out)

@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deciders.baseline import Baseline           # noqa: E402
 from deciders.proposed import Proposed           # noqa: E402
 from sim import engine                           # noqa: E402
+from sim.oracles import OracleAllUp, OracleLinkChoice  # noqa: E402
 from sim.scenario import VARIANTS                # noqa: E402
 
 CFG = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), "..", "config", "sim_themis.yaml")))
@@ -38,6 +39,9 @@ CONFIGS = {
     "Proposed - mission":       ("proposed", {"mission": False}),
     "Proposed - predict":       ("proposed", {"predict": False}),
     "Proposed - degrade":       ("proposed", {"degrade": False}),
+    # upper bounds (read ground truth, not deployable): what a perfect handover could gain
+    "Oracle: perfect link choice": ("oracle", {"cls": OracleLinkChoice}),
+    "Oracle: every up link":    ("oracle", {"cls": OracleAllUp}),
 }
 
 
@@ -47,6 +51,8 @@ def make(name):
     if kind == "baseline":
         cfg["baseline"]["bad_after"] = opt["bad_after"]
         return cfg, Baseline(cfg, dup_video=opt.get("dup_video", False))
+    if kind == "oracle":
+        return cfg, opt["cls"](cfg)
     if "caps" in opt:                                  # speed-cap sensitivity runs
         cfg["proposed"]["caps"] = dict(opt["caps"])
         return cfg, Proposed(cfg)
@@ -107,9 +113,11 @@ def main():
     runs.to_csv(os.path.join(a.out, "runs.csv"), index=False)
     summarise(runs, ["config", "variant"]).to_csv(os.path.join(a.out, "summary.csv"), index=False)
     summarise(cap, ["config", "crater_cap"]).to_csv(os.path.join(a.out, "capacity.csv"), index=False)
-    print(summarise(runs[runs.variant == "nominal"], ["config"])[
-        ["config", "useful_view_pct", "blind_m", "progress_pct", "stale_exec", "interruptions",
-         "false_switches", "dup_overhead_pct"]].round(1).to_string(index=False))
+    cols = ["config", "useful_view_pct", "blind_m", "progress_pct", "stale_exec", "interruptions",
+            "false_switches", "dup_overhead_pct"]
+    for v in ("nominal", "overlap"):
+        print(f"--- {v}")
+        print(summarise(runs[runs.variant == v], ["config"])[cols].round(1).to_string(index=False))
 
 
 if __name__ == "__main__":
