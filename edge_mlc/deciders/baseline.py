@@ -1,13 +1,16 @@
 """Baseline decision module: ATSSS / SpeedFusion-style steering.
 
   * fixed link preference order (wifi, then lte)
+  * fixed priority classes, as configured on real routers: commands > video > bulk
   * fixed per-traffic limits (commands, video) from config `limits`
   * a link is BAD for a class after `bad_after` violating checks in a row,
     GOOD again after `good_after` clean checks in a row (hysteresis)
   * commands always duplicated on the two best links (ATSSS redundant mode)
   * both cameras always sent; each camera adapts its own quality
     (step down on loss, step up after a quiet period), front has priority
-  * no mode awareness, no prediction, no speed cap, no stale-command check
+  * bulk uploads sent as soon as they exist, FIFO, on the current video link,
+    as a greedy TCP-like flow; no knowledge of manoeuvre or stops
+  * no mode awareness, no prediction
 """
 
 class Baseline:
@@ -84,6 +87,10 @@ class Baseline:
             "cmd_links": cmd_links,
             "telem_link": cmd_links[0],
             "video": {c: {"links": vlinks, "level": self.level[c]} for c in ("front", "rear")},
+            # bulk uploads: greedy TCP-like flow on the video link, FIFO, as soon
+            # as items exist (the car ignores this key)
+            "bulk": ({"link": self.video_link, "mode": "greedy"}
+                     if s.get("uploads") else None),
             "cap": 1.0, "status": "N/A", "hb_fast": False,
             "reasons": reasons,
         }

@@ -1,18 +1,22 @@
 """Run every experiment and write the results tables.
 
-  python3 sim/run_experiments.py                 # full set (~10-15 min on 2 cores)
+  python3 sim/run_experiments.py                 # full set: 20 seeds nominal, 10 per variant
   python3 sim/run_experiments.py --seeds 3       # quick check
+
+It first times one nominal run per module and prints the seconds per run; if
+the estimated total exceeds 2.5 h on the available cores it drops to 10 / 5
+seeds and says so.
 
 Outputs (results/):
   runs.csv          one row per run (config x variant x seed)
   summary.csv       mean and 95% confidence interval per config x variant
   capacity.csv      crater capacity sweep (baseline vs proposed)
-  caps.csv          speed-cap sensitivity (progress vs driving without the needed view)
 """
 import argparse
 import copy
 import os
 import sys
+import time
 from multiprocessing import Pool
 
 import numpy as np
@@ -23,25 +27,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deciders.baseline import Baseline           # noqa: E402
 from deciders.proposed import Proposed           # noqa: E402
 from sim import engine                           # noqa: E402
-from sim.oracles import OracleAllUp, OracleLinkChoice  # noqa: E402
 from sim.scenario import VARIANTS                # noqa: E402
 
 CFG = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), "..", "config", "sim_themis.yaml")))
 
 # name -> (kind, options)
 CONFIGS = {
-    "Baseline":                 ("baseline", {"bad_after": 3}),
-    "Baseline (fast, 1 check)": ("baseline", {"bad_after": 1}),
-    "Baseline (5 checks)":      ("baseline", {"bad_after": 5}),
-    "Baseline (slow, 8 checks)": ("baseline", {"bad_after": 8}),
-    "Baseline + duplicate video": ("baseline", {"bad_after": 3, "dup_video": True}),
-    "Proposed":                 ("proposed", {}),
-    "Proposed - mission":       ("proposed", {"mission": False}),
-    "Proposed - predict":       ("proposed", {"predict": False}),
-    "Proposed - degrade":       ("proposed", {"degrade": False}),
-    # upper bounds (read ground truth, not deployable): what a perfect handover could gain
-    "Oracle: perfect link choice": ("oracle", {"cls": OracleLinkChoice}),
-    "Oracle: every up link":    ("oracle", {"cls": OracleAllUp}),
+    "Baseline":                   ("baseline", {}),
+    "Baseline + duplicate video": ("baseline", {"dup_video": True}),
+    "Proposed":                   ("proposed", {}),
+    "Proposed - mission":         ("proposed", {"mission": False}),   # Part A off
+    "Proposed - uploads":         ("proposed", {"uploads": False}),   # Part B off
+    "Proposed - predict":         ("proposed", {"predict": False}),
 }
 
 
@@ -49,22 +46,8 @@ def make(name):
     kind, opt = CONFIGS[name]
     cfg = copy.deepcopy(CFG)
     if kind == "baseline":
-        cfg["baseline"]["bad_after"] = opt["bad_after"]
         return cfg, Baseline(cfg, dup_video=opt.get("dup_video", False))
-    if kind == "oracle":
-        return cfg, opt["cls"](cfg)
-    if "caps" in opt:                                  # speed-cap sensitivity runs
-        cfg["proposed"]["caps"] = dict(opt["caps"])
-        return cfg, Proposed(cfg)
-    return cfg, Proposed(cfg, features={k: v for k, v in opt.items()})
-
-
-# speed caps (CAUTION, DEGRADED) tried in the sensitivity sweep; default is (0.6, 0.3)
-CAP_SWEEP = [(0.6, 0.3), (0.8, 0.5), (0.9, 0.7), (1.0, 1.0)]
-for c, d in CAP_SWEEP:
-    CONFIGS[f"Proposed caps {c}/{d}"] = ("proposed", {"caps": {"OK": 1.0, "CAUTION": c, "DEGRADED": d,
-                                                                "UNAVAILABLE": 0.0}})
-MAIN = [k for k in CONFIGS if not k.startswith("Proposed caps")]
+    return cfg, Proposed(cfg, features=dict(opt))
 
 
 def one(job):
@@ -88,36 +71,51 @@ def summarise(df, keys):
     return pd.DataFrame(rows)
 
 
+def build_jobs(nom_seeds, var_seeds, cap_seeds):
+    jobs = [(c, v, s, None) for v in VARIANTS for c in CONFIGS
+            for s in range(nom_seeds if v == "nominal" else var_seeds)]
+    cjobs = [(c, "nominal", s, {"crater_cap": float(k)}) for k in (750, 1000, 1500, 2500, 4000)
+             for c in ("Baseline", "Proposed", "Proposed - mission") for s in range(cap_seeds)]
+    return jobs, cjobs
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seeds", type=int, default=20)
+    ap.add_argument("--seeds", type=int, default=20,
+                    help="seeds for nominal (other variants get half, capacity sweep at most 5)")
     ap.add_argument("--out", default="results")
-    ap.add_argument("--part", default="all", choices=["all", "main", "caps"])
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    if a.part in ("all", "caps"):
-        sj = [(c, "nominal", s, None) for c in CONFIGS if c.startswith("Proposed caps") for s in range(a.seeds)]
-        with Pool(os.cpu_count()) as p:
-            sw = pd.DataFrame(p.map(one, sj, chunksize=4))
-        summarise(sw, ["config"]).to_csv(os.path.join(a.out, "caps.csv"), index=False)
-        if a.part == "caps":
-            return
 
-    jobs = [(c, v, s, None) for v in VARIANTS for c in MAIN for s in range(a.seeds)]
-    caps = [750, 1000, 1500, 2500, 4000]
-    cjobs = [(c, "nominal", s, {"crater_cap": float(k)}) for k in caps
-             for c in ("Baseline", "Proposed", "Proposed - mission") for s in range(max(3, a.seeds // 2))]
-    with Pool(os.cpu_count()) as p:
-        runs = pd.DataFrame(p.map(one, jobs, chunksize=4))
-        cap = pd.DataFrame(p.map(one, cjobs, chunksize=4))
+    # time one nominal run of each module first
+    secs = []
+    for name in ("Baseline", "Proposed"):
+        t0 = time.perf_counter()
+        one((name, "nominal", 0, None))
+        secs.append(time.perf_counter() - t0)
+        print(f"{name}: {secs[-1]:.1f} s per nominal run")
+
+    nom_seeds, var_seeds, cap_seeds = a.seeds, max(1, (a.seeds + 1) // 2), min(5, a.seeds)
+    jobs, cjobs = build_jobs(nom_seeds, var_seeds, cap_seeds)
+    cores = os.cpu_count() or 1
+    est_h = (len(jobs) + len(cjobs)) * np.mean(secs) / cores / 3600
+    print(f"{len(jobs) + len(cjobs)} runs, estimated {est_h:.1f} h on {cores} cores")
+    if est_h > 2.5 and a.seeds == 20:
+        nom_seeds, var_seeds = 10, 5
+        jobs, cjobs = build_jobs(nom_seeds, var_seeds, cap_seeds)
+        print(f"estimate above 2.5 h: dropping to {nom_seeds} seeds nominal / {var_seeds} per variant "
+              f"({len(jobs) + len(cjobs)} runs)")
+
+    with Pool(cores) as p:
+        runs = pd.DataFrame(p.map(one, jobs, chunksize=1))
+        cap = pd.DataFrame(p.map(one, cjobs, chunksize=1))
     runs.to_csv(os.path.join(a.out, "runs.csv"), index=False)
     summarise(runs, ["config", "variant"]).to_csv(os.path.join(a.out, "summary.csv"), index=False)
     summarise(cap, ["config", "crater_cap"]).to_csv(os.path.join(a.out, "capacity.csv"), index=False)
-    cols = ["config", "useful_view_pct", "blind_m", "progress_pct", "stale_exec", "interruptions",
-            "false_switches", "dup_overhead_pct"]
-    for v in ("nominal", "overlap"):
-        print(f"--- {v}")
-        print(summarise(runs[runs.variant == v], ["config"])[cols].round(1).to_string(index=False))
+    cols = ["config", "useful_view_pct", "video_delay_p95_bulk_ms", "req_mean_s", "bg_done_before_end",
+            "mission_time_s", "interruptions", "blind_m", "dup_overhead_pct"]
+    print("--- nominal")
+    print(summarise(runs[runs.variant == "nominal"], ["config"])[cols].round(1).to_string(index=False))
 
 
 if __name__ == "__main__":

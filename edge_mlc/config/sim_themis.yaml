@@ -22,7 +22,7 @@ links:
   - name: lte               # opportunistic 4G, patchy
     id: 3
     nominal_kbps: 5000      # (A)
-    signal_unusable: 20     # (A) modem signal quality %
+    signal_unusable: -115   # RSRP dBm (A)
 
 # Video quality ladder (MJPEG). kbps values are (A) until measured with
 # tools/measure_ladder.py on YOUR cameras and scene.
@@ -70,10 +70,13 @@ proposed:
   switch_cost_s: 0.3        # (A) measure: time to move a stream to 4G
   hold_s: 3.0               # no moving back for 3 s after a switch
   return_stable_s: 3.0      # preferred link must be usable this long
-  # --- graceful degradation ---
-  stale_cmd_ms: 200
-  cap_raise_after_s: 2.0
-  caps: {OK: 1.0, CAUTION: 0.6, DEGRADED: 0.3, UNAVAILABLE: 0.0}
+
+# Part B: data upload scheduling by vehicle state (deciders/proposed.py)
+uploads:
+  stopped_share: 0.7        # (A) bulk may use up to 70% of the link while stopped
+  thin_kbps: 3000           # (A) "thin link" threshold while driving (estimated capacity)
+  bg_share_strong: 0.3      # (A) background cap on a strong link while driving
+  queue_guard_ms: 80        # (A) bulk pauses when rtt exceeds the 10 s minimum by this
 
 # Needs table: per mode, which streams matter, allowed levels
 # (lowest = minimum useful), and their limits in that mode.

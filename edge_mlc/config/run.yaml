@@ -79,10 +79,6 @@ proposed:
   switch_cost_s: 0.3        # (A) measure: time to move a stream to 4G
   hold_s: 3.0               # no moving back for 3 s after a switch
   return_stable_s: 3.0      # preferred link must be usable this long
-  # --- graceful degradation ---
-  stale_cmd_ms: 200
-  cap_raise_after_s: 2.0
-  caps: {OK: 1.0, CAUTION: 0.6, DEGRADED: 0.3, UNAVAILABLE: 0.0}
 
 # Needs table: per mode, which streams matter, allowed levels
 # (lowest = minimum useful), and their limits in that mode.
