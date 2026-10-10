@@ -25,14 +25,19 @@ The v2 scenario is position-based: link conditions follow where the vehicle IS
 (radio fades beyond the ridge at 1.3-1.6 km, 4G is RSRP from two towers, Starlink
 is jammed at 2.45-2.80 km), not mission time. The driver is a state machine over
 position; a slower vehicle really does spend longer in the bad spots. The mission
-also creates bulk upload work (a crater LiDAR scan and inspection stills/clips on
-request, a 4K recording and route LiDAR as background): all of it shares each
-link's modem uplink FIFO with the video and telemetry, so a greedy uploader
-(the baseline) builds a standing queue that delays everything else. The proposed
-module schedules uploads by vehicle state instead (fast while stopped, requested
-items only on thin links, background capped while driving, a delay-based queue
-guard). There is no graceful degradation (speed caps, stale-command rejection)
-in v2.
+also creates bulk upload work: recording and route-LiDAR chunks every 60 s as
+background, plus a crater LiDAR scan and inspection stills/clips on request.
+All of it shares each link's modem uplink FIFO with the video and telemetry.
+Both modules shape their uploads (rate-limited below the capacity estimate with
+router queue management, like CAKE autorate) so the comparison is fair. What is
+compared is the ORDER inside the shaped budget: `video_first` (cameras always
+win), `urgent_first` (requested data always beats extra video quality) and the
+proposed `adaptive` (urgent-first while stopped or in a precision manoeuvre,
+video-first while driving). `Baseline (no shaping)` keeps a greedy TCP-like
+uploader as a reference. Usability is scored against an operator `requirements:`
+table (frame age, delivered fps, resolution per true manoeuvre) that only the
+simulator reads, never the deciders. There is no graceful degradation (speed
+caps, stale-command rejection) in v2.
 
 Files:
     sim/scenario.py         driver state machine + position-based link models + 5 harder variants

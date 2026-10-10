@@ -49,7 +49,9 @@ DEFAULTS = {
     "blackout_s": 6.0,                          # (A) blackout length, once per mission
     "lte": True,
     "fade": (1.30, 1.60),                       # (A) radio -65 -> -100 dBm over these km (terrain)
-    "crater_cap": 1500.0,                       # (A) Starlink kbps in the crater
+    "crater_cap": 1000.0,                       # (A) Starlink kbps in the crater: genuinely
+                                                #     too little for two cameras
+    "buffer_scale": 1.0,                        # (A) scales Starlink + 4G modem buffers (sensitivity)
 }
 
 # ---------------------------------------------------------------- driver
@@ -79,19 +81,20 @@ class Driver:
         "END":             (0.0,  0.0, 0.0,  "STOPPED"),
     }
 
-    # upload items created on entering a state: (id, kind, MB, requested)
+    # upload items REQUESTED on entering a state: (id, kind, MB, requested).
+    # Background data is not event-driven: the vehicle adds a 10 MB recording
+    # chunk and a 5 MB LiDAR chunk every 60 s (sim/engine.py).
     # sizes (A); 1 MB = 8000 kbit
     EVENTS = {
         "CRATER_STOP1": [("lidar_crater", "lidar", 20, True)],
-        "INSPECT":      [("still", "still", 4, True), ("clip", "clip", 30, True),
-                         ("recording_4k", "recording", 80, False),
-                         ("lidar_route", "lidar", 50, False)],
+        "INSPECT":      [("still", "still", 4, True), ("clip", "clip", 30, True)],
     }
 
     def __init__(self):
         self.state, self.since = "START", 0.0
         self.direction = 1              # +1 outbound, -1 on the return leg
         self.in_crater = False
+        self.scan_fired = False         # one-shot scan_drive request at 1.70 km
 
     def _next(self, t, d):
         s, dt_ = self.state, t - self.since
@@ -112,6 +115,11 @@ class Driver:
 
     def step(self, t, d):
         ev = []
+        # requested scan WHILE DRIVING: first time past 1.70 km outbound,
+        # where Starlink is the only link (A)
+        if not self.scan_fired and self.direction > 0 and d >= 1.70:
+            self.scan_fired = True
+            ev.append({"id": "scan_drive", "kind": "scan", "size_kbit": 20 * 8000.0, "requested": True})
         nxt = self._next(t, d)
         if nxt:
             self.state, self.since = nxt, t
@@ -242,7 +250,7 @@ def link_state(link, t, d, ctx):
             owd_ms=30 + max(0.0, 15 - sinr) * 3,
             jit_ms=8.0,
             cap_kbps=5000 * min(max((sinr - 3) / 17, 0.05), 1.0),
-            buffer_ms=600.0)
+            buffer_ms=600.0 * v["buffer_scale"])
 
     # ---- starlink (no signal reported); effects applied in this order:
     up, loss, owd, cap = True, 0.003, 22.0, 8000.0
@@ -262,7 +270,8 @@ def link_state(link, t, d, ctx):
     bt = ctx["blackout_t"]                        # jammer blackout (position-triggered, once)
     if bt is not None and bt <= t < bt + v["blackout_s"]:
         up = False
-    return dict(up=up, signal=None, loss=loss, owd_ms=owd, jit_ms=4.0, cap_kbps=cap, buffer_ms=300.0)
+    return dict(up=up, signal=None, loss=loss, owd_ms=owd, jit_ms=4.0, cap_kbps=cap,
+                buffer_ms=300.0 * v["buffer_scale"])
 
 
 # ---------------------------------------------------------------- self check

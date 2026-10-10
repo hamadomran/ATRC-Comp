@@ -71,12 +71,22 @@ proposed:
   hold_s: 3.0               # no moving back for 3 s after a switch
   return_stable_s: 3.0      # preferred link must be usable this long
 
-# Part B: data upload scheduling by vehicle state (deciders/proposed.py)
+# Bulk upload shaping, shared by baseline and proposed (what differs between
+# them is only urgency ordering and the vehicle-state trade-off)
 uploads:
-  stopped_share: 0.7        # (A) bulk may use up to 70% of the link while stopped
-  thin_kbps: 3000           # (A) "thin link" threshold while driving (estimated capacity)
-  bg_share_strong: 0.3      # (A) background cap on a strong link while driving
-  queue_guard_ms: 80        # (A) bulk pauses when rtt exceeds the 10 s minimum by this
+  bulk_budget_share: 0.9    # (A) bulk rate budget: share of the estimated capacity
+  queue_guard_ms: 30        # (A) router queue management: bulk capped at the drain
+                            #     rate once the backlog exceeds this many ms
+
+# Operator usability requirements per TRUE manoeuvre (from the driver script).
+# Read ONLY by the simulator's metrics (sim/engine.py), never by the decision
+# modules: usability is defined independently of the controller under test.
+# All values (A)  # to be backed by teleoperation literature
+requirements:
+  DRIVE:     {cam: front, max_age_s: 0.5, min_fps: 10, min_w: 320}
+  REVERSE:   {cam: rear,  max_age_s: 0.5, min_fps: 10, min_w: 320}
+  PRECISION: {cam: front, max_age_s: 0.5, min_fps: 5,  min_w: 640}
+  STOPPED:   {cam: front, max_age_s: 1.0, min_fps: 2,  min_w: 640}
 
 # Needs table: per mode, which streams matter, allowed levels
 # (lowest = minimum useful), and their limits in that mode.

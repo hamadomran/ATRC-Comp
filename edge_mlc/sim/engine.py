@@ -12,6 +12,8 @@ What is SIMULATED:       the links (sim/scenario.py), the vehicle's position,
 import heapq
 import itertools
 import math
+from bisect import bisect_right
+from collections import deque
 
 import numpy as np
 
@@ -37,6 +39,7 @@ class Sim:
         self.driver = S.Driver()
         self.links = [l["name"] for l in cfg["links"]]
         self.ladder = cfg["ladder"]
+        self.reqs = cfg["requirements"]      # operator usability per TRUE manoeuvre (metrics only)
         self.now = 0.0
         self.q, self.cnt = [], itertools.count()
         self.mon = Monitor(cfg["links"], cfg["timing"]["hb_timeout_ms"], clock=lambda: self.now)
@@ -57,12 +60,18 @@ class Sim:
 
         # vehicle upload queue (bulk data)
         self.uploads = []
+        self.bg_n = 0
         self.bulk_sent_kbit = 0.0
         self.bulk_active = False
         self.bulk_req_kbps = self.bulk_bg_kbps = 0.0
+        self.qdelay_bulk_max = {l: 0.0 for l in self.links}   # queue delay while bulk moved
+        self.qd_bulk_n = self.qd_bulk_hi = 0                  # physics steps with bulk; of those, > 40 ms
+        self.guard_ms = cfg.get("uploads", {}).get("queue_guard_ms", 30.0)   # (A) router AQM
 
-        # video frame latency log: (latency_ms, capture_t, bulk_active_at_capture)
+        # video frame log: (latency_ms, capture_t, bulk_at_capture, cam, manoeuvre_at_capture)
         self.frames = []
+        self.arrivals = {c: deque() for c in ("front", "rear")}   # (arrival_t) last ~1 s per camera
+        self.bulk_item = None                                     # id of the item being sent
 
         # plan state (v2: no graceful degradation, the speed cap is always 1.0)
         self.plan = None
@@ -122,14 +131,15 @@ class Sim:
         # uplink queues: video + telemetry + bulk share each link's modem FIFO
         bp = (self.plan or {}).get("bulk")
         pending = [u for u in self.uploads if u["delivered_kbit"] < u["size_kbit"]]
-        order = []
+        order, target = [], None
         if bp and pending:
-            if bp.get("mode") == "rate":          # proposed: requested first, then background
-                order = sorted(pending, key=lambda u: (not u["requested"], u["created_t"]))
+            if bp.get("mode") == "rate":          # shaped: the decider names the item
+                target = next((u for u in pending if u["id"] == bp.get("item")), None)
             else:                                 # greedy: plain FIFO by creation
                 order = sorted(pending, key=lambda u: u["created_t"])
+                target = order[0]
         self.bulk_req_kbps = self.bulk_bg_kbps = 0.0
-        self.bulk_active = False
+        self.bulk_active, self.bulk_item = False, None
         for ln in self.links:
             T = self.tr(ln)
             offered = TELEM_KBPS * (ln in self.cmd_links[:1])
@@ -137,21 +147,25 @@ class Sim:
                 if ln in vc["links"]:
                     offered += self.ladder[vc["level"]]["kbps"]
             bulk_rate = 0.0
-            if order and bp["link"] == ln:
+            if target is not None and bp["link"] == ln:
                 if bp.get("mode") == "greedy":    # TCP-like: fill the bottleneck and the buffer
                     bulk_rate = max(0.0, T["cap_kbps"] - offered)
                     if self.backlog[ln] < 0.9 * T["cap_kbps"] * T["buffer_ms"] / 1000:
                         bulk_rate += 0.1 * T["cap_kbps"]
                 else:
                     bulk_rate = max(0.0, bp.get("rate_kbps") or 0.0)
+                    # router queue management (A): once the backlog passes the
+                    # guard, bulk gets at most the drain rate minus other traffic
+                    if self.backlog[ln] > self.guard_ms / 1000 * T["cap_kbps"]:
+                        bulk_rate = min(bulk_rate, max(0.0, T["cap_kbps"] - offered))
             bulk_in = bulk_rate * dt
             inn = offered * dt + bulk_in
             self.kbit_sent[ln] += inn
             if bulk_in > 0:
                 self.bulk_sent_kbit += bulk_in
-                order[0]["sent_kbit"] += bulk_in
-                self.bulk_active = True
-                if order[0]["requested"]:
+                target["sent_kbit"] += bulk_in
+                self.bulk_active, self.bulk_item = True, target["id"]
+                if target["requested"]:
                     self.bulk_req_kbps = bulk_rate
                 else:
                     self.bulk_bg_kbps = bulk_rate
@@ -168,9 +182,14 @@ class Sim:
             self.win[ln]["sent"] += inn
             self.win[ln]["got"] += max(0.0, inn - drop) * (1 - T["loss"])
             self.qdelay_max[ln] = max(self.qdelay_max[ln], self.qdelay(ln, T))
-            if bulk_in > 0:                       # goodput; lost bulk data is resent,
-                rem = bulk_in * (1 - frac) * (1 - T["loss"])   # so `remaining` falls by delivered only
-                for u in order:
+            if bulk_in > 0:
+                qd = self.qdelay(ln, T)
+                self.qdelay_bulk_max[ln] = max(self.qdelay_bulk_max[ln], qd)
+                self.qd_bulk_n += 1
+                self.qd_bulk_hi += qd > 40.0
+                # goodput; lost bulk data is resent, so `remaining` falls by delivered only
+                rem = bulk_in * (1 - frac) * (1 - T["loss"])
+                for u in ([target] if bp.get("mode") == "rate" else order):
                     if rem <= 0:
                         break
                     x = min(rem, u["size_kbit"] - u["delivered_kbit"])
@@ -227,13 +246,25 @@ class Sim:
             arr = self.now + (self.owd(T) + self.qdelay(ln, T) + HUB_TO_OP_MS) / 1000
             best = arr if best is None else min(best, arr)          # first copy wins
         if best is not None:
-            self.at(best, self.frame_arrives, cam, self.now, v["level"], self.bulk_active)
+            self.at(best, self.frame_arrives, cam, self.now, v["level"], self.bulk_active, self.man)
         self.at(self.now + 1 / lv["fps"], self.camera, cam, gen)
 
-    def frame_arrives(self, cam, t_cap, level, bulk):
-        self.frames.append(((self.now - t_cap) * 1000.0, t_cap, bulk))
+    def frame_arrives(self, cam, t_cap, level, bulk, man):
+        self.frames.append(((self.now - t_cap) * 1000.0, t_cap, bulk, cam, man))
+        self.arrivals[cam].append(self.now)
         if t_cap > self.view[cam][0]:
             self.view[cam] = (t_cap, level)
+
+    # ------------------------------------------------------------ background recording
+    def bg_chunks(self):
+        """Every 60 s the vehicle queues a 4K recording chunk (10 MB) and a
+        route-LiDAR chunk (5 MB) as background uploads (A)."""
+        self.bg_n += 1
+        for id_, kind, mb in ((f"rec_{self.bg_n}", "recording", 10), (f"lidar_{self.bg_n}", "lidar", 5)):
+            self.uploads.append(dict(id=id_, kind=kind, size_kbit=mb * 8000.0, requested=False,
+                                     created_t=self.now, created_d=self.d,
+                                     sent_kbit=0.0, delivered_kbit=0.0, done_t=None, done_d=None))
+        self.at(self.now + 60.0, self.bg_chunks)
 
     # ------------------------------------------------------------ commands (driver -> car)
     def operator(self):
@@ -300,11 +331,20 @@ class Sim:
 
     # ------------------------------------------------------------ measurement (0.1 s grid)
     def sample(self):
+        # usability is defined by the operator requirements for the TRUE
+        # manoeuvre (config `requirements:`), independent of the controller:
+        # the required camera must meet frame age, delivered frame rate over
+        # the last 1 s, and resolution (from the newest frame's level)
         man = self.man
-        need = self.cfg["modes"][man]
-        prot = min(need, key=lambda c: need[c]["prio"])
+        rq = self.reqs[man]
+        prot = rq["cam"]
+        arr = self.arrivals[prot]
+        while arr and self.now - arr[0] > 1.0:
+            arr.popleft()
+        fps = len(arr)                            # frames that ARRIVED in the last 1 s
         tcap, level = self.view[prot]
-        fresh = self.now - tcap <= FRESH_S
+        age_ok = self.now - tcap <= rq["max_age_s"]
+        useful = age_ok and fps >= rq["min_fps"] and self.ladder[level]["w"] >= rq["min_w"]
         thr_exec = 0.0 if self.failsafe else self.car_cmd[0]
         p = self.plan or {"video": {prot: {"links": []}}, "mode": "N/A"}
         self.rows.append(dict(
@@ -312,13 +352,15 @@ class Sim:
             d=self.d, dir=self.driver.direction, state=self.driver.state,
             seg=S.segment(self.d, self.driver.direction, self.driver.state),
             crater=self.driver.in_crater, v_mps=abs(self.v_mps),
-            useful=fresh and level >= need[prot]["levels"][0],
-            live=fresh and level >= 2, level=level if fresh else 0,
+            useful=useful, fps=fps,
+            live=self.now - tcap <= FRESH_S and level >= 2,
+            level=level if age_ok else 0,
             link=(p["video"][prot]["links"] or [None])[0],
             dup=len(p["video"][prot]["links"]) > 1,
             thr_int=self.thr_int, thr_exec=thr_exec, fs=self.failsafe,
             mode=p.get("mode"),
             bulk=self.bulk_active, bulk_req_kbps=self.bulk_req_kbps, bulk_bg_kbps=self.bulk_bg_kbps,
+            bulk_item=self.bulk_item,
             up={ln: self.tr(ln)["up"] for ln in self.links},
         ))
         self.at(self.now + 0.1, self.sample)
@@ -332,6 +374,7 @@ class Sim:
         self.at(0.0, self.operator)
         self.at(0.1, self.decide)
         self.at(0.15, self.sample)
+        self.at(60.0, self.bg_chunks)
         while self.q:
             t, _, fn, args = heapq.heappop(self.q)
             if t > S.T_MAX or self.done:
@@ -352,6 +395,29 @@ class Sim:
             if not T["up"] or T["loss"] > req["max_loss"] or 2 * T["owd_ms"] > req["max_rtt_ms"]:
                 return False
         return bool(rs)
+
+    def transition_events(self, R):
+        """Link-change events from ground truth along this run's trajectory:
+        any link's `up` flips, or the best available true capacity changes by
+        >= 30% within 1 s. Events closer than 5 s are merged (first kept)."""
+        best = []
+        for r in R:
+            caps = []
+            for ln in self.links:
+                T = self.truth_at(ln, r)
+                if T["up"]:
+                    caps.append(T["cap_kbps"])
+            best.append(max(caps) if caps else 0.0)
+        events = [(b["t"], "up/down") for a, b in zip(R, R[1:]) if a["up"] != b["up"]]
+        for i in range(10, len(R)):               # 10 samples = 1 s
+            a, b = best[i - 10], best[i]
+            if min(a, b) < 0.7 * max(a, b) - 1e-9:
+                events.append((R[i]["t"], "capacity"))
+        merged = []
+        for t, kind in sorted(events):
+            if not merged or t - merged[-1][0] >= 5.0:
+                merged.append((t, kind))
+        return merged
 
     def metrics(self):
         R = [r for r in self.rows if r["t"] >= 3.0]
@@ -421,20 +487,54 @@ class Sim:
         latb = np.array([f[0] for f in self.frames if f[2]])
         Rb = [r for r in R if r["bulk"]]
 
-        # uploads
+        # uploads (Experiment B)
         up = {}
         reqd = [u for u in self.uploads if u["requested"]]
         for u in reqd:
-            up[f"req_{u['id']}_s"] = (u["done_t"] - u["created_t"]) if u["done_t"] is not None else np.nan
-        up["req_mean_s"] = float(np.mean(list(up.values()))) if reqd else np.nan
+            up[f"{u['id']}_s"] = (u["done_t"] - u["created_t"]) if u["done_t"] is not None else np.nan
+        req_ts = list(up.values())
+        up["req_mean_s"] = float(np.mean(req_ts)) if reqd else np.nan
+        up["req_max_s"] = float(np.max(req_ts)) if reqd else np.nan
         bg = [u for u in self.uploads if not u["requested"]]
-        bg_done = bool(bg) and all(u["done_t"] is not None for u in bg)
-        last_bg = max((u for u in bg if u["done_t"] is not None), key=lambda u: u["done_t"], default=None)
-        up["bg_done_before_end"] = float(bg_done)
-        up["bg_done_d"] = last_bg["done_d"] if bg_done else np.nan
+        up["bg_backlog_mb_at_end"] = sum(u["size_kbit"] - u["delivered_kbit"] for u in bg) / 8000
+        up["bg_delivered_mb"] = sum(u["delivered_kbit"] for u in bg) / 8000
         up["bulk_mbit_total"] = self.bulk_sent_kbit / 1000
+        # the video cost of pushing urgent data, in both situations
+        Rd = [r for r in R if r["bulk_item"] == "scan_drive"]
+        up["needed_fps_while_req_drive"] = float(np.mean([r["fps"] for r in Rd])) if Rd else np.nan
+        Rs = [r for r in R if r["bulk_item"] in ("lidar_crater", "still", "clip")]
+        up["needed_level_while_req_stopped"] = float(np.mean([r["level"] for r in Rs])) if Rs else np.nan
 
-        return dict(**seg, **up,
+        # neutral measures per true manoeuvre
+        for man, rq in self.reqs.items():
+            rr = [r for r in R if r["man"] == man]
+            up[f"fps_delivered_mean_{man}"] = float(np.mean([r["fps"] for r in rr])) if rr else np.nan
+            up[f"level_mean_{man}"] = float(np.mean([r["level"] for r in rr])) if rr else np.nan
+            ls = [f[0] for f in self.frames if f[4] == man and f[3] == rq["cam"] and f[1] >= 3.0]
+            up[f"frame_delay_p95_ms_{man}"] = float(np.percentile(ls, 95)) if ls else np.nan
+
+        # Experiment A: behaviour around ground-truth link changes
+        events = self.transition_events(R)
+        wins, trans = [], {}
+        for t, _ in events:                       # merge overlapping [t-2, t+10] windows
+            if wins and t - 2.0 <= wins[-1][1]:
+                wins[-1] = (wins[-1][0], t + 10.0)
+            else:
+                wins.append((t - 2.0, t + 10.0))
+        starts = [w[0] for w in wins]
+
+        def inwin(t):
+            i = bisect_right(starts, t) - 1
+            return i >= 0 and t <= wins[i][1]
+        Rw = [r for r in R if inwin(r["t"])]
+        trans["n_transition_events"] = len(events)
+        trans["n_trans_updown"] = sum(1 for _, k in events if k == "up/down")
+        trans["n_trans_capacity"] = sum(1 for _, k in events if k == "capacity")
+        trans["useful_transition_pct"] = 100 * np.mean([r["useful"] for r in Rw]) if Rw else np.nan
+        trans["interruptions_transition"] = sum(
+            1 for a, b in zip(R, R[1:]) if a["useful"] and not b["useful"] and inwin(b["t"]))
+
+        return dict(**seg, **up, **trans,
             radio_leave_minus_fail_s=t_leave - t_fail,
             mission_time_s=float(self.mission_time if self.mission_time is not None else min(self.now, S.T_MAX)),
             mission_completed=float(self.mission_time is not None),
@@ -455,6 +555,8 @@ class Sim:
             switches=sw, false_switches=fs, pingpongs=pp,
             dup_overhead_pct=100 * self.kbit_dup / max(tot, 1e-9),
             **{f"qdelay_max_{ln}_ms": self.qdelay_max[ln] for ln in self.links},
+            **{f"qdelay_bulk_max_{ln}_ms": self.qdelay_bulk_max[ln] for ln in self.links},
+            bulk_qdelay_over40_pct=100 * self.qd_bulk_hi / max(self.qd_bulk_n, 1),
             total_mbit=tot / 1000,
         )
 

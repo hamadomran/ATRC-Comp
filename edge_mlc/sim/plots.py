@@ -19,12 +19,15 @@ from sim.run_experiments import make          # noqa: E402
 from sim.scenario import SEGMENTS             # noqa: E402
 
 C = {"Baseline": "#8a8f98", "Baseline + duplicate video": "#c3b28f", "Proposed": "#1764c0",
-     "Proposed - mission": "#9cc0ea", "Proposed - uploads": "#8fd0c9", "Proposed - predict": "#6fa3de"}
+     "Proposed - mission": "#9cc0ea", "Proposed - uploads": "#8fd0c9", "Proposed - predict": "#6fa3de",
+     "Baseline (no shaping)": "#4c5057", "Proposed (urgent_first)": "#0e3f7e"}
+# the three upload policies of Experiment B (same shaping, different order)
+POLICIES = [("Proposed - uploads", "video-first"), ("Proposed (urgent_first)", "urgent-first"),
+            ("Proposed", "adaptive (ours)")]
 LINKC = {"radio": "#5b8c5a", "starlink": "#7a5ea8", "lte": "#d08a3c"}
 plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False,
                      "axes.titleweight": "bold", "axes.titlesize": 11, "figure.dpi": 150})
 
-REQ_ITEMS = [("lidar_crater", "crater LiDAR\n(20 MB)"), ("still", "still\n(4 MB)"), ("clip", "clip\n(30 MB)")]
 
 
 def simulate(seed=0):
@@ -110,6 +113,8 @@ def capacity(Cp, out):
     ax.set_xticks([0.75, 1, 1.5, 2.5, 4])
     ax.set_xticklabels(["0.75", "1", "1.5", "2.5", "4"])
     ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    ax.axvline(1.0, color="#999", lw=1, ls=":")
+    ax.text(1.0, 3, " scenario default (1.0)", fontsize=7.5, color="#666")
     ax.set_xlabel("Satellite capacity in the crater (Mbps)")
     ax.set_ylabel("Needed view available in crater (%)")
     ax.set_ylim(0, 105)
@@ -139,21 +144,69 @@ def segments(S, out):
     plt.close(fig)
 
 
-def uploads(S, out, sims):
+def expA_transitions(S, out):
+    """Experiment A: behaviour around ground-truth link changes."""
+    nom = S[S.variant == "nominal"].set_index("config")
+    cfgs = ["Baseline", "Baseline + duplicate video", "Proposed", "Proposed - mission"]
+    fig, ax = plt.subplots(figsize=(7.5, 3.8))
+    v = [nom.loc[c, "useful_transition_pct"] for c in cfgs]
+    e = [nom.loc[c, "useful_transition_pct_ci"] for c in cfgs]
+    ax.bar(np.arange(len(cfgs)), v, 0.6, yerr=e, color=[C[c] for c in cfgs], capsize=3)
+    for i, (val, err) in enumerate(zip(v, e)):
+        ax.text(i, val + err + 0.5, f"{val:.1f}", ha="center", fontsize=9)
+    ax.set_xticks(np.arange(len(cfgs)))
+    ax.set_xticklabels([c.replace("Baseline + duplicate video", "Baseline\n+ dup. video")
+                        .replace("Proposed - mission", "Proposed\nwithout mission") for c in cfgs],
+                       fontsize=8.5)
+    ax.set_ylabel("needed view available (%)")
+    ax.set_ylim(0, 105)
+    ax.set_title("Needed view inside transition windows [-2 s, +10 s]", loc="left")
+    n_ev = nom.loc["Proposed", "n_transition_events"]
+    n_ud = nom.loc["Proposed", "n_trans_updown"]
+    n_cap = nom.loc["Proposed", "n_trans_capacity"]
+    ax.text(0.99, 0.04, f"events per mission (mean): {n_ev:.0f}\n"
+            f"  link up/down: {n_ud:.0f}\n  capacity ≥ 30%/s: {n_cap:.0f}",
+            transform=ax.transAxes, ha="right", fontsize=8, color="#444",
+            bbox=dict(fc="#f6f6f6", ec="#ddd"))
+    fig.tight_layout()
+    fig.savefig(os.path.join(out, "expA_transitions.png"))
+    plt.close(fig)
+
+
+def expB_uploads(S, out):
+    """Experiment B: the three upload policies. Each static policy should lose
+    in one situation; plot whatever comes out."""
     nom = S[S.variant == "nominal"].set_index("config")
     fig, axs = plt.subplots(1, 2, figsize=(11, 3.8))
     ax = axs[0]
-    w = 0.38
-    for i, c in enumerate(["Baseline", "Proposed"]):
-        v = [nom.loc[c, f"req_{k}_s"] for k, _ in REQ_ITEMS]
-        e = [nom.loc[c, f"req_{k}_s_ci"] for k, _ in REQ_ITEMS]
-        ax.bar(np.arange(len(REQ_ITEMS)) + (i - 0.5) * w, v, w, yerr=e, color=C[c], label=c, capsize=2)
-    ax.set_xticks(np.arange(len(REQ_ITEMS)))
-    ax.set_xticklabels([lab for _, lab in REQ_ITEMS], fontsize=8.5)
+    w = 0.26
+    groups = [("scan_drive_s", "20 MB scan\nwhile DRIVING"), ("lidar_crater_s", "20 MB scan\nwhile STOPPED")]
+    for i, (cfg, lab) in enumerate(POLICIES):
+        v = [nom.loc[cfg, k] for k, _ in groups]
+        e = [nom.loc[cfg, k + "_ci"] for k, _ in groups]
+        ax.bar(np.arange(len(groups)) + (i - 1) * w, v, w, yerr=e, color=C[cfg], label=lab, capsize=2)
+    ax.set_xticks(np.arange(len(groups)))
+    ax.set_xticklabels([lab for _, lab in groups], fontsize=8.5)
     ax.set_ylabel("seconds from request to delivered")
-    ax.set_title("Time to deliver each requested item", loc="left")
+    ax.set_title("Urgent scan delivery time, driving vs stopped", loc="left")
     ax.legend(frameon=False, fontsize=8)
     ax = axs[1]
+    v = [nom.loc[cfg, "needed_fps_while_req_drive"] for cfg, _ in POLICIES]
+    e = [nom.loc[cfg, "needed_fps_while_req_drive_ci"] for cfg, _ in POLICIES]
+    ax.bar(np.arange(len(POLICIES)), v, 0.55, yerr=e, color=[C[c] for c, _ in POLICIES], capsize=3)
+    ax.axhline(10, color="#b33", lw=1, ls="--")
+    ax.text(0.02, 10.25, "DRIVE needs 10 fps", fontsize=8, color="#b33")
+    ax.set_xticks(np.arange(len(POLICIES)))
+    ax.set_xticklabels([lab for _, lab in POLICIES], fontsize=8.5)
+    ax.set_ylabel("delivered fps (front camera)")
+    ax.set_title("Video frame rate while the driving scan uploads", loc="left")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out, "expB_uploads.png"))
+    plt.close(fig)
+
+
+def appendix_video_delay(out, sims):
+    fig, ax = plt.subplots(figsize=(6, 3.6))
     for name, sim in sims.items():
         lat = np.sort([f[0] for f in sim.frames if f[2]])
         if len(lat):
@@ -162,10 +215,10 @@ def uploads(S, out, sims):
     ax.set_xlabel("video frame delay while bulk data was moving (ms)")
     ax.set_ylabel("fraction of frames")
     ax.set_ylim(0, 1.02)
-    ax.set_title("Does uploading hurt the live view?", loc="left")
+    ax.set_title("Appendix: frame delay CDF while uploading", loc="left")
     ax.legend(frameon=False, fontsize=8, loc="lower right")
     fig.tight_layout()
-    fig.savefig(os.path.join(out, "uploads.png"))
+    fig.savefig(os.path.join(out, "appendix_video_delay.png"))
     plt.close(fig)
 
 
@@ -265,7 +318,9 @@ def main():
     variants(S, a.out)
     segments(S, a.out)
     capacity(Cp, a.out)
-    uploads(S, a.out, sims)
+    expA_transitions(S, a.out)
+    expB_uploads(S, a.out)
+    appendix_video_delay(a.out, sims)
     timeline(a.out, sims)
     print("charts in", a.out)
 
