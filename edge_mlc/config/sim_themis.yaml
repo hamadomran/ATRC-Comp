@@ -22,7 +22,7 @@ links:
   - name: lte               # opportunistic 4G, patchy
     id: 3
     nominal_kbps: 5000      # (A)
-    signal_unusable: 20     # (A) modem signal quality %
+    signal_unusable: -115   # RSRP dBm (A)
 
 # Video quality ladder (MJPEG). kbps values are (A) until measured with
 # tools/measure_ladder.py on YOUR cameras and scene.
@@ -70,10 +70,23 @@ proposed:
   switch_cost_s: 0.3        # (A) measure: time to move a stream to 4G
   hold_s: 3.0               # no moving back for 3 s after a switch
   return_stable_s: 3.0      # preferred link must be usable this long
-  # --- graceful degradation ---
-  stale_cmd_ms: 200
-  cap_raise_after_s: 2.0
-  caps: {OK: 1.0, CAUTION: 0.6, DEGRADED: 0.3, UNAVAILABLE: 0.0}
+
+# Bulk upload shaping, shared by baseline and proposed (what differs between
+# them is only urgency ordering and the vehicle-state trade-off)
+uploads:
+  bulk_budget_share: 0.9    # (A) bulk rate budget: share of the estimated capacity
+  queue_guard_ms: 30        # (A) router queue management: bulk capped at the drain
+                            #     rate once the backlog exceeds this many ms
+
+# Operator usability requirements per TRUE manoeuvre (from the driver script).
+# Read ONLY by the simulator's metrics (sim/engine.py), never by the decision
+# modules: usability is defined independently of the controller under test.
+# All values (A)  # to be backed by teleoperation literature
+requirements:
+  DRIVE:     {cam: front, max_age_s: 0.5, min_fps: 10, min_w: 320}
+  REVERSE:   {cam: rear,  max_age_s: 0.5, min_fps: 10, min_w: 320}
+  PRECISION: {cam: front, max_age_s: 0.5, min_fps: 5,  min_w: 640}
+  STOPPED:   {cam: front, max_age_s: 1.0, min_fps: 2,  min_w: 640}
 
 # Needs table: per mode, which streams matter, allowed levels
 # (lowest = minimum useful), and their limits in that mode.

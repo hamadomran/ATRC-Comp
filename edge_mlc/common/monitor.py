@@ -3,6 +3,7 @@
 Per link it keeps:
   rtt_ms     median heartbeat round-trip over the last 1 s
   rtt_p90    90th percentile over the last 1 s
+  rtt_min10  lowest answered round-trip over the last 10 s (queue-delay reference)
   loss       share of heartbeats (sent 0.4-1.4 s ago) never echoed
   miss_streak consecutive heartbeats unanswered after hb_timeout
   alive      False once 3 heartbeats in a row are missed
@@ -168,6 +169,7 @@ class Monitor:
                     alive=alive,
                     rtt_ms=float(np.median(rtts)) if rtts else 9999.0,
                     rtt_p90=float(np.percentile(rtts, 90)) if rtts else 9999.0,
+                    rtt_min10=float(min(r for _, r in st.rtt10)) if st.rtt10 else None,
                     loss=loss,
                     miss_streak=st.miss_streak,
                     cap_kbps=st.cap_kbps if (alive and report_fresh) else 0.0,

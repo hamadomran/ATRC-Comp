@@ -122,7 +122,7 @@ def main():
                 return                                   # duplicate copy or out of order
             c = P.jload(m["payload"])
             age_ms = (time.time() - c["t_op"]) * 1000
-            stale = dec.reject_stale and age_ms > cfg["proposed"]["stale_cmd_ms"]
+            stale = dec.reject_stale and age_ms > cfg["proposed"].get("stale_cmd_ms", 200)
             st["last_cmd_seq"] = m["seq"]
             st["op_mode"] = c.get("mode") or None
             log.log("cmd_rx", seq=m["seq"], link=ln, age_ms=round(age_ms, 1), stale=stale,

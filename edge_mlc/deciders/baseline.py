@@ -1,22 +1,47 @@
 """Baseline decision module: ATSSS / SpeedFusion-style steering.
 
   * fixed link preference order (wifi, then lte)
+  * fixed priority classes, as configured on real routers: commands > video > bulk
   * fixed per-traffic limits (commands, video) from config `limits`
   * a link is BAD for a class after `bad_after` violating checks in a row,
     GOOD again after `good_after` clean checks in a row (hysteresis)
   * commands always duplicated on the two best links (ATSSS redundant mode)
   * both cameras always sent; each camera adapts its own quality
     (step down on loss, step up after a quiet period), front has priority
-  * no mode awareness, no prediction, no speed cap, no stale-command check
+  * bulk uploads sent as soon as they exist, on the current video link.
+    upload_mode picks the shaping, as configured on real routers:
+      "shaped" (default)  rate-limited below the capacity estimate (adaptive
+                          shaping, like CAKE autorate), requested items before
+                          background, cameras before all bulk: the static
+                          video-first default
+      "greedy"            TCP-like, fills the modem queue ("no traffic
+                          shaping" reference only)
+    No knowledge of manoeuvre or stops either way.
+  * no mode awareness, no prediction
 """
+
+
+def shaped_bulk(uploads, link, used_kbps, cap_est, share):
+    """Traffic-shaped bulk plan: lowest priority (rate = share of the capacity
+    estimate minus what commands and cameras use), requested items before
+    background, FIFO inside each class."""
+    if not uploads:
+        return None
+    head = next((u for u in uploads if u["requested"]), uploads[0])
+    return {"link": link, "mode": "rate", "item": head["id"],
+            "rate_kbps": max(0.0, share * cap_est - used_kbps)}
+
 
 class Baseline:
     name = "baseline"
     reject_stale = False
 
-    def __init__(self, cfg, dup_video=False):
+    def __init__(self, cfg, dup_video=False, upload_mode="shaped"):
         self.cfg = cfg
         self.dup_video = dup_video          # True = SpeedFusion "WAN smoothing": video always on 2 links
+        self.upload_mode = upload_mode
+        self.share = cfg.get("uploads", {}).get("bulk_budget_share", 0.9)   # (A)
+        self.ladder = cfg["ladder"]
         self.b = cfg["baseline"]
         self.order = [l["name"] for l in cfg["links"]]
         self.lim = cfg["limits"]
@@ -79,11 +104,24 @@ class Baseline:
         if self.dup_video:
             other = [l for l in good_v + self.order if l != self.video_link]
             vlinks += other[:1]
+
+        # bulk uploads on the video link, as soon as items exist (the car
+        # ignores this key)
+        uploads = s.get("uploads") or []
+        if not uploads:
+            bulk = None
+        elif self.upload_mode == "greedy":
+            bulk = {"link": self.video_link, "mode": "greedy"}
+        else:
+            used = 30.0 + sum(self.ladder[self.level[c]]["kbps"] for c in ("front", "rear"))
+            bulk = shaped_bulk(uploads, self.video_link, used, links[self.video_link]["cap_kbps"],
+                               self.share)
         return {
             "mode": "N/A",
             "cmd_links": cmd_links,
             "telem_link": cmd_links[0],
             "video": {c: {"links": vlinks, "level": self.level[c]} for c in ("front", "rear")},
+            "bulk": bulk,
             "cap": 1.0, "status": "N/A", "hb_fast": False,
             "reasons": reasons,
         }

@@ -1,11 +1,21 @@
 """Proposed decision module.
 
-Feature 1  Mission-aware allocation  (ModeDetector + Allocator)
-Feature 2  Predictive switching      (Predictor: trend rule + known handover schedule)
-Feature 3  Graceful degradation      (Degrader; stale-command check in the car program)
+Feature 1  Mission-aware allocation
+  Part A   camera allocation by manoeuvre   (ModeDetector + Allocator)
+  Part B   data upload scheduling by vehicle state (rate-limited bulk uploads)
+Feature 2  Predictive switching              (Predictor: trend rule + handover schedule)
+
+Part B is an upload_policy; all three share the same traffic shaping, queue
+guard, bulk-link choice and camera allocation, only the order inside the
+room differs:
+  "video_first"   cameras (full quality) always before requested uploads
+  "urgent_first"  requested uploads always before camera-above-minimum
+  "adaptive"      ours: urgent_first while STOPPED/PRECISION, video_first
+                  while DRIVE/REVERSE
 
 Each feature can be switched off for ablation runs:
-  Proposed(cfg, features={"mission": True, "predict": True, "degrade": True})
+  Proposed(cfg, features={"mission": True, "uploads": True, "predict": True})
+(uploads off forces upload_policy="video_first".)
 
 Link names come from the config (first link = preferred). The decision
 module never sees ground truth: only the measured snapshot it is given.
@@ -171,8 +181,12 @@ class Allocator:
                 and now - self.switched_at[stream] >= self.p["hold_s"]
                 and mode not in ("REVERSE", "PRECISION"))
 
-    def allocate(self, now, links, mode, needs, predict_on, reasons):
+    def allocate(self, now, links, mode, needs, predict_on, reasons, reserve=None):
+        """reserve: kbps per link already promised to bulk uploads that outrank
+        camera quality above the minimum (requested items, or any bulk while
+        stopped). The protected camera's MINIMUM level is never reduced by it."""
         room = {ln: self.p["headroom"] * links[ln]["cap_kbps"] for ln in self.links}
+        reserve = reserve or {}
         cmd_req = self.cfg["limits"]["cmd"]
         unmet, degraded = [], []
 
@@ -193,8 +207,12 @@ class Allocator:
                 continue
             req = {"max_rtt_ms": need.get("max_rtt_ms", 600), "max_loss": need.get("max_loss", 0.2)}
             min_kbps = self.ladder[levels[0]]["kbps"]
+            # room left after the bulk reservation; the protected (prio 1)
+            # camera's minimum outranks bulk, so it ignores the reservation
+            free = {ln: room[ln] - (0.0 if need["prio"] <= 1 else reserve.get(ln, 0.0))
+                    for ln in self.links}
             cands = [ln for ln in self.links
-                     if self.usable(now, links[ln], ln, cam, req, predict_on) and room[ln] >= min_kbps]
+                     if self.usable(now, links[ln], ln, cam, req, predict_on) and free[ln] >= min_kbps]
             cur = self.current[cam]
             if not cands:
                 alive = [ln for ln in self.links if links[ln]["alive"]]
@@ -217,7 +235,7 @@ class Allocator:
                     unmet.append(cam)
                     reasons.append(f"{cam}: no link alive -> minimum level kept on {cur}")
                     continue
-                trickle = [ln for ln in self.links if links[ln]["alive"] and room[ln] >= self.ladder[1]["kbps"]]
+                trickle = [ln for ln in self.links if links[ln]["alive"] and free[ln] >= self.ladder[1]["kbps"]]
                 if trickle and levels[0] > 0:
                     video[cam] = {"links": [trickle[0]], "level": 1}
                     room[trickle[0]] -= self.ladder[1]["kbps"]
@@ -237,7 +255,8 @@ class Allocator:
                 reasons.append(f"{cam}: {cur}->{choice}")
                 self.current[cam] = choice
                 self.switched_at[cam] = now
-            fit = [lv for lv in levels if self.ladder[lv]["kbps"] <= room[choice]]
+            # levels above the minimum come after reserved bulk (requested uploads)
+            fit = [lv for lv in levels if self.ladder[lv]["kbps"] <= room[choice] - reserve.get(choice, 0.0)]
             level = fit[-1] if fit else levels[0]
             room[choice] -= self.ladder[level]["kbps"]
             video[cam] = {"links": [choice], "level": level}
@@ -245,50 +264,24 @@ class Allocator:
 
 
 # ===================================================================
-# Feature 3: graceful degradation
-# ===================================================================
-class Degrader:
-    def __init__(self, p):
-        self.p = p
-        self.cap = 1.0
-        self.ok_since = None
-
-    def evaluate(self, now, plan, needs, links, unmet, degraded, uncovered):
-        prot = [c for c, n in needs.items() if n["prio"] == 1]
-        if "cmd" in unmet or any(c in unmet for c in prot):
-            status = "UNAVAILABLE"                  # nothing can carry it: stop
-        elif "cmd" in degraded or any(c in degraded for c in prot):
-            status = "DEGRADED"                     # carried, but on a link below spec
-        elif uncovered or any(plan["video"][c]["level"] <= needs[c]["levels"][0] for c in prot):
-            status = "CAUTION"                      # failure predicted with no backup, or view at its minimum
-        else:
-            status = "OK"
-        target = self.p["caps"][status]
-        if target < self.cap:                       # lower immediately
-            self.cap, self.ok_since = target, None
-        elif target > self.cap:                     # raise only after stable period
-            self.ok_since = self.ok_since or now
-            if now - self.ok_since >= self.p["cap_raise_after_s"]:
-                self.cap, self.ok_since = target, None
-        else:
-            self.ok_since = None
-        return self.cap, status
-
-
-# ===================================================================
 # The module the main loop calls
 # ===================================================================
+# Part B thresholds, used if the config has no `uploads:` block; all (A)
+UPLOAD_DEFAULTS = {"bulk_budget_share": 0.9, "queue_guard_ms": 30.0}
+
+
 class Proposed:
     name = "proposed"
+    reject_stale = False
 
-    def __init__(self, cfg, features=None):
+    def __init__(self, cfg, features=None, upload_policy="adaptive"):
         self.cfg, self.p = cfg, cfg["proposed"]
-        self.f = {"mission": True, "predict": True, "degrade": True, **(features or {})}
-        self.reject_stale = self.f["degrade"]
+        self.f = {"mission": True, "uploads": True, "predict": True, **(features or {})}
+        self.upload_policy = upload_policy if self.f["uploads"] else "video_first"
+        self.up = {**UPLOAD_DEFAULTS, **cfg.get("uploads", {})}
         self.mode_det = ModeDetector(self.p)
         self.pred = Predictor(cfg)
         self.alloc = Allocator(cfg, self.pred)
-        self.deg = Degrader(self.p)
         self.links = [l["name"] for l in cfg["links"]]
 
     def _backup(self, now, links, cur, stream, req, kbps, margin):
@@ -301,15 +294,23 @@ class Proposed:
              and links[l]["cap_kbps"] * self.p["headroom"] >= kbps]
         return min(c, key=lambda l: links[l]["rtt_ms"]) if c else None
 
+    def _bulk_link(self, links):
+        """Link for bulk: alive, meets the video loss limit, highest estimated
+        capacity. May differ from the video link."""
+        vreq = self.cfg["limits"]["video"]
+        cands = [l for l in self.links if links[l]["alive"] and links[l]["loss"] <= vreq["max_loss"]]
+        return max(cands, key=lambda l: links[l]["cap_kbps"]) if cands else None
+
     def decide(self, s):
         now, links, reasons = s["now"], s["links"], []
+        uploads = s.get("uploads") or []
 
-        # Feature 1a: mode + needs
+        # Feature 1a (Part A): mode + needs. The detector always runs: Part B
+        # keys its rate rules on the real mode even when Part A is off.
+        det_mode = self.mode_det.update(now, s["thr"], s["steer"], s.get("op_mode"))
         if self.f["mission"]:
-            mode = self.mode_det.update(now, s["thr"], s["steer"], s.get("op_mode"))
-            needs = self.cfg["modes"][mode]
+            mode, needs = det_mode, self.cfg["modes"][det_mode]
         else:
-            self.mode_det.update(now, s["thr"], s["steer"], None)
             mode, needs = "FIXED", FIXED_NEEDS
 
         # Feature 2a: time-until-unusable for every link x stream
@@ -323,11 +324,35 @@ class Proposed:
                 for st, req in reqs.items():
                     self.pred.ttu[(ln, st)] = self.pred.time_until_unusable(ln, req)
 
-        # Feature 1b: allocation
-        cmd_links, video, unmet, degraded = self.alloc.allocate(now, links, mode, needs, self.f["predict"], reasons)
+        # Feature 1 Part B: upload scheduling. Requested items go first (FIFO),
+        # then background (FIFO). When the policy says urgent data outranks
+        # camera quality above the minimum, it reserves its rate BEFORE
+        # allocation; otherwise the cameras come first and bulk gets what is
+        # left (computed after allocation).
+        bulk, reserve, head, bln = None, {}, None, None
+        if uploads:
+            bln = self._bulk_link(links)
+            if bln is not None:
+                head = next((u for u in uploads if u["requested"]), uploads[0])
+                urgent = (self.upload_policy == "urgent_first"
+                          or (self.upload_policy == "adaptive"
+                              and det_mode in ("STOPPED", "PRECISION")))
+                if head["requested"] and urgent:
+                    used = 30.0                   # ~20 Hz commands + telemetry (A)
+                    prot = min(needs, key=lambda c: needs[c]["prio"])
+                    if self.alloc.current.get(prot) == bln and needs[prot]["levels"][0] > 0:
+                        used += self.cfg["ladder"][needs[prot]["levels"][0]]["kbps"]
+                    rate = max(0.0, self.up["bulk_budget_share"] * links[bln]["cap_kbps"] - used)
+                    bulk = {"link": bln, "mode": "rate", "rate_kbps": rate, "item": head["id"]}
+                    if rate > 0:
+                        reserve = {bln: rate}
+
+        # Feature 1b (Part A): allocation
+        cmd_links, video, unmet, degraded = self.alloc.allocate(
+            now, links, mode, needs, self.f["predict"], reasons, reserve)
 
         # Feature 2b: graded actions on protected streams
-        actions, uncovered = {}, []
+        actions = {}
         if self.f["predict"]:
             m = self.pred.margin(self.mode_det.speed)
             for cam, n in needs.items():
@@ -338,8 +363,6 @@ class Proposed:
                 kbps = self.cfg["ladder"][video[cam]["level"]]["kbps"]
                 req = {"max_rtt_ms": n.get("max_rtt_ms", 600), "max_loss": n.get("max_loss", 0.2)}
                 b = self._backup(now, links, cur, cam, req, kbps, m)
-                if t < 3 * m and b is None:
-                    uncovered.append(cam)               # failure coming and nowhere to go
                 if t < m:
                     actions[cam] = "SWITCH"
                     if b:           # move now rather than waiting for next cycle
@@ -364,14 +387,17 @@ class Proposed:
                     actions[cam] = "NORMAL"
             # commands are tiny: always on two links when two exist (as baseline)
 
-        plan = {"mode": mode, "cmd_links": cmd_links, "telem_link": cmd_links[0], "video": video,
+        # Part B, video-first / background case: bulk gets what is left after
+        # the cameras, from the same budget and engine queue guard as always
+        if uploads and bln is not None and bulk is None:
+            used = 30.0 + sum(self.cfg["ladder"][v["level"]]["kbps"]
+                              for v in video.values() if bln in v["links"])
+            rate = max(0.0, self.up["bulk_budget_share"] * links[bln]["cap_kbps"] - used)
+            bulk = {"link": bln, "mode": "rate", "rate_kbps": rate, "item": head["id"]}
+
+        return {"mode": mode, "cmd_links": cmd_links, "telem_link": cmd_links[0], "video": video,
+                "bulk": bulk,                     # optional: the car ignores it
                 "hb_fast": any(a != "NORMAL" for a in actions.values()),
                 "actions": actions, "reasons": reasons,
+                "cap": 1.0, "status": "N/A",      # graceful degradation removed in v2
                 "ttu": {f"{k[0]}:{k[1]}": (round(v, 2) if v != INF else None) for k, v in self.pred.ttu.items()}}
-
-        # Feature 3: speed cap + operator status
-        if self.f["degrade"]:
-            plan["cap"], plan["status"] = self.deg.evaluate(now, plan, needs, links, unmet, degraded, uncovered)
-        else:
-            plan["cap"], plan["status"] = 1.0, "N/A"
-        return plan
