@@ -14,6 +14,7 @@ Link 1 always delivers. Outputs one video per case, a side-by-side
 comparison and stats.json.
 """
 import argparse
+import itertools
 import json
 import os
 import shutil
@@ -66,17 +67,24 @@ def main():
     if not cap.isOpened():
         raise SystemExit(f"cannot open {a.video}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
-    frames = []
-    while True:
-        ok, img = cap.read()
-        if not ok or (a.seconds and len(frames) >= a.seconds * fps):
-            break
-        frames.append(img)
-    if not frames:
+    limit = int(a.seconds * fps) if a.seconds else None
+
+    def frames():                                   # streamed: long clips never sit in memory
+        n = 0
+        while limit is None or n < limit:
+            ok, img = cap.read()
+            if not ok:
+                return
+            yield img
+            n += 1
+
+    stream = frames()
+    first = next(stream, None)
+    if first is None:
         raise SystemExit("no frames read")
 
     # full stream 640 wide at the clip's aspect ratio (stripes are 16 px), base half that
-    h0, w0 = frames[0].shape[:2]
+    h0, w0 = first.shape[:2]
     W, H = 640, max(16, round(640 * h0 / w0 / 16) * 16)
     four = cv2.VideoWriter_fourcc(*"mp4v")
     side = cv2.VideoWriter(os.path.join(a.out, "comparison.mp4"), four, fps, (3 * W, H))
@@ -88,7 +96,9 @@ def main():
         writers[key] = cv2.VideoWriter(os.path.join(a.out, key + ".mp4"), four, fps, (W, H))
         stats[key] = {"psnr": [], "full": 0, "partial": 0, "base_only": 0, "held": 0, "stripes": []}
 
-    for n, img in enumerate(frames):
+    n_frames = 0
+    for n, img in enumerate(itertools.chain([first], stream)):
+        n_frames += 1
         ref = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
         panels = []
         for key, name, _ in CASES:
@@ -120,14 +130,14 @@ def main():
         to_h264(os.path.join(a.out, f + ".mp4"))
 
     s = senders[CASES[0][0]]
-    summary = {"frames": len(frames), "fps": fps, "stripes_per_frame": s.n_stripes, "parity": a.parity,
+    summary = {"frames": n_frames, "fps": fps, "stripes_per_frame": s.n_stripes, "parity": a.parity,
                "layout": {"link 1": "base + parity packets", "link 2": "base + full-resolution stripe packets"}}
-    print(f"{len(frames)} frames at {fps:.0f} fps, {s.n_stripes} stripes per frame, parity {a.parity:.0%} of the data packets\n")
+    print(f"{n_frames} frames at {fps:.0f} fps, {s.n_stripes} stripes per frame, parity {a.parity:.0%} of the data packets\n")
     print(f"{'case':<20}{'full':>7}{'partial':>9}{'base only':>11}{'held':>6}{'stripes':>9}{'PSNR dB':>9}"
           f"{'link1 kbps':>12}{'link2 kbps':>12}")
     for key, name, _ in CASES:
         st = stats[key]
-        N = len(frames)
+        N = n_frames
         kbps = [ln.bytes_sent * 8 / 1000 / (N / fps) for ln in links[key]]
         row = {"full_pct": 100 * st["full"] / N, "partial_pct": 100 * st["partial"] / N,
                "base_only_pct": 100 * st["base_only"] / N, "held_pct": 100 * st["held"] / N,

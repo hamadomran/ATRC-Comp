@@ -5,7 +5,7 @@ __pycache__/
 
 # sample videos and demo output stay local (multi-link demo, camera clips)
 multilink_demo/samples/
-multilink_demo/output/
+multilink_demo/output*/
 *.mp4
 *.mov
 *.avi
