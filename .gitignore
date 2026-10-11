@@ -2,3 +2,13 @@ __pycache__/
 *.pyc
 .DS_Store
 .idea/
+
+# sample videos and demo output stay local (multi-link demo, camera clips)
+multilink_demo/samples/
+multilink_demo/output/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.h264

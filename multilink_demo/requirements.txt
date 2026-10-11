@@ -1,0 +1,3 @@
+numpy
+opencv-python-headless   # opencv-python on a laptop with a display
+zfec                     # Reed-Solomon erasure code
