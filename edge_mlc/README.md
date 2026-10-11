@@ -41,9 +41,11 @@ caps, stale-command rejection) in v2.
 
 Files:
     sim/scenario.py         driver state machine + position-based link models + 5 harder variants
+                            + 2 handover variants (overlap, overlap_harsh: cell-edge 4G along the route)
+    sim/oracles.py          ground-truth oracles (perfect link choice, every up link): handover upper bounds
     sim/engine.py           discrete-event simulator (kinematics, queues, uploads) + metrics
     sim/run_experiments.py  configs x variants x seeds -> results/runs.csv, summary.csv, capacity.csv
-    sim/plots.py            charts (timeline, headline, ablation, segments, uploads, variants, capacity)
+    sim/plots.py            charts (timeline, headline, ablation, segments, uploads, variants, capacity, handover)
 
 ## Phase 2 (later): the RC car
 

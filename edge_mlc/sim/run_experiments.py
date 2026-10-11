@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deciders.baseline import Baseline           # noqa: E402
 from deciders.proposed import Proposed           # noqa: E402
 from sim import engine                           # noqa: E402
+from sim.oracles import OracleAllUp, OracleLinkChoice  # noqa: E402
 from sim.scenario import VARIANTS                # noqa: E402
 
 CFG = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), "..", "config", "sim_themis.yaml")))
@@ -42,15 +43,22 @@ CONFIGS = {
     # Experiment B references, nominal only
     "Proposed (urgent_first)":    ("proposed", {"policy": "urgent_first"}),
     "Baseline (no shaping)":      ("baseline", {"upload_mode": "greedy"}),
+    # upper bounds for handover (read ground truth, not deployable)
+    "Oracle: perfect link choice": ("oracle", {"cls": OracleLinkChoice}),
+    "Oracle: every up link":      ("oracle", {"cls": OracleAllUp}),
 }
 MAIN = ["Baseline", "Baseline + duplicate video", "Proposed",
         "Proposed - mission", "Proposed - uploads", "Proposed - predict"]
 REFS = ["Proposed (urgent_first)", "Baseline (no shaping)"]
+ORACLES = ["Oracle: perfect link choice", "Oracle: every up link"]
+HANDOVER_VARIANTS = ["overlap", "overlap_harsh"]     # only these let link choice matter
 
 
 def make(name):
     kind, opt = CONFIGS[name]
     cfg = copy.deepcopy(CFG)
+    if kind == "oracle":
+        return cfg, opt["cls"](cfg)
     if kind == "baseline":
         return cfg, Baseline(cfg, dup_video=opt.get("dup_video", False),
                              upload_mode=opt.get("upload_mode", "shaped"))
@@ -83,6 +91,8 @@ def build_jobs(nom_seeds, var_seeds, cap_seeds):
     jobs = [(c, v, s, None) for v in VARIANTS for c in MAIN
             for s in range(nom_seeds if v == "nominal" else var_seeds)]
     jobs += [(c, "nominal", s, None) for c in REFS for s in range(nom_seeds)]
+    jobs += [(c, v, s, None) for v in ["nominal"] + HANDOVER_VARIANTS for c in ORACLES
+             for s in range(nom_seeds if v == "nominal" else var_seeds)]
     cjobs = [(c, "nominal", s, {"crater_cap": float(k)}) for k in (750, 1000, 1500, 2500, 4000)
              for c in ("Baseline", "Proposed", "Proposed - mission") for s in range(cap_seeds)]
     # modem buffer sensitivity: Starlink buffer_ms in {50,150,300}, 4G scaled the same way
@@ -138,6 +148,11 @@ def main():
     acols = ["config", "n_transition_events", "useful_transition_pct", "interruptions_transition"]
     ac = ["Baseline", "Baseline + duplicate video", "Proposed", "Proposed - mission"]
     print(summarise(nom[nom.config.isin(ac)], ["config"])[acols].round(1).to_string(index=False))
+    print("--- Handover headroom: interruptions vs the oracles")
+    hc = ["Baseline", "Baseline + duplicate video", "Proposed - predict", "Proposed"] + ORACLES
+    h = runs[runs.config.isin(hc) & runs.variant.isin(["nominal"] + HANDOVER_VARIANTS)]
+    print(h.pivot_table(index="config", columns="variant", values=["interruptions", "useful_view_pct",
+                                                                     "dup_overhead_pct"]).loc[hc].round(1).to_string())
     print("--- Experiment B: uploads (nominal)")
     ucols = ["config", "scan_drive_s", "lidar_crater_s", "still_s", "clip_s",
              "needed_fps_while_req_drive", "needed_level_while_req_stopped",
