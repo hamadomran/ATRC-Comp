@@ -33,7 +33,7 @@ with the same yardstick.
 | | Baseline | Proposed |
 |---|---|---|
 | Usable view, whole mission | 76% | **84%** |
-| View interruptions per mission | 74 | **44** |
+| View interruptions per mission | 74 | **47** |
 | Video delay (p95) while uploads run | 62 ms | 70 ms |
 | Mission completed | yes (~22 min) | yes (~22 min) |
 
@@ -51,7 +51,7 @@ after each event:
 |---|---|---|
 | Baseline | 79.9% | 52 |
 | Baseline + duplicate video | 81.4% | 38 |
-| **Proposed** | **85.3%** | **28** |
+| **Proposed** | **85.3%** | **30** |
 | Proposed without mission-awareness | 82.9% | 41 |
 
 Duplicating video on two links (the brute-force fix) buys the baseline less than
@@ -76,6 +76,26 @@ drags the driving view down to exactly the 10 fps minimum (and causes the most
 view interruptions overall: 64 vs 44). Video-first keeps the view clean but makes
 the operator wait 3× longer for urgent data. Adaptive keeps the full 19 fps while
 driving and still gets the stopped-request items fastest.
+
+## Handover headroom — how much could better prediction gain?
+
+Two ground-truth oracles (`sim/oracles.py`) read the simulator's true link state, so
+they are upper bounds, not deployable controllers. *Perfect link choice* moves the
+protected camera to a link that stays good for the next 0.5 s; *every up link* sends
+it on all links that are up. Two extra variants (`overlap`, `overlap_harsh`) add
+cell-edge 4G along the whole route, so there is usually a second link to hand over to.
+
+| interruptions per mission | nominal | overlap | overlap_harsh |
+|---|---|---|---|
+| Baseline | 74 | 133 | 177 |
+| Proposed without prediction | 48 | 120 | 150 |
+| Proposed | 47 | 108 | 144 |
+| Oracle: perfect link choice | 41 | 107 | 119 |
+| Oracle: every up link (+26-35% data) | 48 | 106 | 106 |
+
+On the nominal mission a perfect predictor would remove about 6 of 47 interruptions;
+with overlapping coverage and harsh handovers it removes about 25, and redundancy on
+every link does better still. Chart: `results/charts/handover.png`.
 
 ## Where the proposed design does not win — reported as found
 

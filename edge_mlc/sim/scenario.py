@@ -22,6 +22,10 @@ position decides the radio and 4G signal and the jamming; time decides the
 Starlink handovers and the congestion burst; vehicle state decides the crater
 obstruction and the jammer blackout.
 
+Variants (VARIANTS below) make one thing harder each. "overlap" and
+"overlap_harsh" add cell-edge 4G along the whole route, so more than one link is
+usable most of the time and the choice of link at a handover matters.
+
 Randomness (shadowing, handover outages) is pre-generated from the run seed so
 both decision modules see identical conditions and re-runs are identical.
 """
@@ -40,6 +44,11 @@ VARIANTS = {
     "heavy_jamming":    {"jam_zone": (2.40, 2.85), "jam_ramp_km": 0.25, "blackout_s": 12.0},
     "no_lte":           {"lte": False},
     "fast_fade":        {"fade": (1.50, 1.60)},
+    # coverage overlaps: cell-edge 4G along the whole route, so more than one
+    # link is usable most of the time and the choice of link at a handover
+    # matters (elsewhere Starlink is often the only link)
+    "overlap":          {"lte_route": True},
+    "overlap_harsh":    {"lte_route": True, "ho_p_out": 0.8, "ho_out_s": (0.5, 2.5)},
 }
 DEFAULTS = {
     "ho_p_out": 0.35, "ho_out_s": (0.2, 1.2),   # (A) chance + length of an outage at a Starlink handover
@@ -48,6 +57,7 @@ DEFAULTS = {
     "blackout_at": 2.75,                        # (A) jammer blackout: first time d >= this (km)
     "blackout_s": 6.0,                          # (A) blackout length, once per mission
     "lte": True,
+    "lte_route": False,                         # (A) cell-edge 4G along the whole route
     "fade": (1.30, 1.60),                       # (A) radio -65 -> -100 dBm over these km (terrain)
     "crater_cap": 1000.0,                       # (A) Starlink kbps in the crater: genuinely
                                                 #     too little for two cameras
@@ -205,8 +215,15 @@ def make_ctx(variant="nominal", seed=0, overrides=None, shadow=True):
                 dur = rng.uniform(*v["ho_out_s"])
                 ho_down[i0:int((h + dur) / DT)] = True
     ho_owd[int(430.0 / DT):int(433.0 / DT)] += 325.0   # (A) gateway congestion burst at t=430 s
+    lte_edge = None
+    if v["lte_route"]:
+        # (A) cell-edge RSRP around -114 dBm (usable for video ~2/3 of the time),
+        # fading in and out over seconds; own random stream, other links unchanged
+        r4 = np.random.default_rng([seed, 4])
+        t = np.arange(n) * DT
+        lte_edge = -114.0 + _ar1(r4, n, 5.0, 6.0) + 3.0 * np.sin(2 * np.pi * t / 45 + r4.uniform(0, 6))
     return {"v": v, "sh_radio": sh_radio, "sh_lte": sh_lte, "ho_owd": ho_owd, "ho_down": ho_down,
-            "in_crater": False, "blackout_t": None}
+            "lte_edge": lte_edge, "in_crater": False, "blackout_t": None}
 
 
 def link_state(link, t, d, ctx):
@@ -240,7 +257,10 @@ def link_state(link, t, d, ctx):
                         cap_kbps=0.0, buffer_ms=600.0)
         r1 = -80.0 - 39.0 * math.log10(max(d, 0.1) / 0.1)   # (A) base tower
         r2 = -90.0 - 128.0 * abs(d - 2.0)                   # (A) village tower at 2.0 km
-        rsrp = max(r1, r2) + ctx["sh_lte"][i]
+        rsrp = max(r1, r2)
+        if ctx.get("lte_edge") is not None:
+            rsrp = max(rsrp, ctx["lte_edge"][i])
+        rsrp += ctx["sh_lte"][i]
         # (A) noise floor ~ -125 dBm per resource element; one quiet tower, no
         # interference, so RSRQ is near-constant and not modelled
         sinr = rsrp + 125.0

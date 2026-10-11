@@ -36,6 +36,8 @@ class Sim:
         self.cfg, self.dec = cfg, decider
         self.rng = np.random.default_rng(seed + 1000)
         self.ctx = S.make_ctx(variant, seed, overrides)
+        if hasattr(decider, "attach_sim"):         # oracles only (sim/oracles.py)
+            decider.attach_sim(self)
         self.driver = S.Driver()
         self.links = [l["name"] for l in cfg["links"]]
         self.ladder = cfg["ladder"]
