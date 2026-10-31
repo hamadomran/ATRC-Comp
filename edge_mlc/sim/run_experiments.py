@@ -46,11 +46,19 @@ CONFIGS = {
     # upper bounds for handover (read ground truth, not deployable)
     "Oracle: perfect link choice": ("oracle", {"cls": OracleLinkChoice}),
     "Oracle: every up link":      ("oracle", {"cls": OracleAllUp}),
+    # redundancy across links (Feature 3), on top of the full Proposed decider
+    "Proposed + base-layer copy":  ("proposed", {"redundancy": "base_copy"}),
+    "Proposed + full copy":        ("proposed", {"redundancy": "full_copy"}),
+    "Proposed + FEC":              ("proposed", {"redundancy": "fec"}),
+    "Proposed + two-stream FEC":   ("proposed", {"redundancy": "two_stream"}),
+    "Proposed + graded two-stream": ("proposed", {"redundancy": "graded"}),
 }
 MAIN = ["Baseline", "Baseline + duplicate video", "Proposed",
         "Proposed - mission", "Proposed - uploads", "Proposed - predict"]
 REFS = ["Proposed (urgent_first)", "Baseline (no shaping)"]
 ORACLES = ["Oracle: perfect link choice", "Oracle: every up link"]
+REDUNDANT = ["Proposed + base-layer copy", "Proposed + full copy", "Proposed + FEC",
+             "Proposed + two-stream FEC", "Proposed + graded two-stream"]
 HANDOVER_VARIANTS = ["overlap", "overlap_harsh"]     # only these let link choice matter
 
 
@@ -62,8 +70,9 @@ def make(name):
     if kind == "baseline":
         return cfg, Baseline(cfg, dup_video=opt.get("dup_video", False),
                              upload_mode=opt.get("upload_mode", "shaped"))
-    feats = {k: v for k, v in opt.items() if k != "policy"}
-    return cfg, Proposed(cfg, features=feats, upload_policy=opt.get("policy", "adaptive"))
+    feats = {k: v for k, v in opt.items() if k not in ("policy", "redundancy")}
+    return cfg, Proposed(cfg, features=feats, upload_policy=opt.get("policy", "adaptive"),
+                         redundancy=opt.get("redundancy"))
 
 
 def one(job):
@@ -91,7 +100,7 @@ def build_jobs(nom_seeds, var_seeds, cap_seeds):
     jobs = [(c, v, s, None) for v in VARIANTS for c in MAIN
             for s in range(nom_seeds if v == "nominal" else var_seeds)]
     jobs += [(c, "nominal", s, None) for c in REFS for s in range(nom_seeds)]
-    jobs += [(c, v, s, None) for v in ["nominal"] + HANDOVER_VARIANTS for c in ORACLES
+    jobs += [(c, v, s, None) for v in ["nominal"] + HANDOVER_VARIANTS for c in ORACLES + REDUNDANT
              for s in range(nom_seeds if v == "nominal" else var_seeds)]
     cjobs = [(c, "nominal", s, {"crater_cap": float(k)}) for k in (750, 1000, 1500, 2500, 4000)
              for c in ("Baseline", "Proposed", "Proposed - mission") for s in range(cap_seeds)]
@@ -153,6 +162,12 @@ def main():
     h = runs[runs.config.isin(hc) & runs.variant.isin(["nominal"] + HANDOVER_VARIANTS)]
     print(h.pivot_table(index="config", columns="variant", values=["interruptions", "useful_view_pct",
                                                                      "dup_overhead_pct"]).loc[hc].round(1).to_string())
+    print("--- Redundancy across links (overlap + overlap_harsh)")
+    rc = ["Proposed"] + REDUNDANT + ORACLES
+    rr = runs[runs.config.isin(rc) & runs.variant.isin(HANDOVER_VARIANTS)]
+    rcols = ["useful_view_pct", "longest_interruption_s", "blind_m", "full_level_pct",
+             "dup_overhead_pct", "video_delay_p95_ms"]
+    print(rr.groupby("config")[rcols].mean().loc[rc].round(1).to_string())
     print("--- Experiment B: uploads (nominal)")
     ucols = ["config", "scan_drive_s", "lidar_crater_s", "still_s", "clip_s",
              "needed_fps_while_req_drive", "needed_level_while_req_stopped",

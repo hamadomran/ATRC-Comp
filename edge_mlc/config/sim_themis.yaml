@@ -78,6 +78,18 @@ uploads:
   queue_guard_ms: 30        # (A) router queue management: bulk capped at the drain
                             #     rate once the backlog exceeds this many ms
 
+# Redundancy across links for the protected camera (Feature 3, Proposed only).
+#   none        Proposed as is
+#   full_copy   full stream on every alive link
+#   base_copy   full stream on one link, base stream on the others (~9% extra data)
+#   fec         full stream coded so any n-1 of n links rebuild it
+#   two_stream  base stream on every link + full coded to survive one link loss
+#   graded      base stream on every link + full needs any 2 links
+# The base stream is the mode's minimum ladder level. Off by default so the
+# headline results are unchanged; run_experiments.py compares all schemes.
+redundancy:
+  scheme: none
+
 # Operator usability requirements per TRUE manoeuvre (from the driver script).
 # Read ONLY by the simulator's metrics (sim/engine.py), never by the decision
 # modules: usability is defined independently of the controller under test.

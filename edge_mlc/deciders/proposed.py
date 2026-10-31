@@ -13,6 +13,11 @@ room differs:
   "adaptive"      ours: urgent_first while STOPPED/PRECISION, video_first
                   while DRIVE/REVERSE
 
+Feature 3  Redundancy across links (optional, off by default): send the
+  protected camera on every alive link so a link dropping does not cost the
+  picture. `redundancy` picks the scheme (see REDUNDANCY below); the engine
+  models the delivery (sim/engine.py camera_red).
+
 Each feature can be switched off for ablation runs:
   Proposed(cfg, features={"mission": True, "uploads": True, "predict": True})
 (uploads off forces upload_policy="video_first".)
@@ -264,6 +269,58 @@ class Allocator:
 
 
 # ===================================================================
+# Feature 3: redundancy across links
+# ===================================================================
+# The protected camera's plan gains a "red" entry the engine understands:
+#   full_links  links that carry a share of the full stream
+#   k           how many of those shares rebuild a full frame (1 = plain copies)
+#   base        ladder level of the base stream (None = no base stream)
+#   base_links  links that carry the whole base stream
+# With n alive links:
+REDUNDANCY = {
+    "none":       "Proposed as is (one link, duplicate only when predicted)",
+    "full_copy":  "full stream whole on every alive link, first copy wins",
+    "base_copy":  "full stream on Proposed's link, base stream on every other alive link",
+    "fec":        "full stream erasure coded over n links, any n-1 rebuild it",
+    "two_stream": "base on every alive link + full coded so any n-1 links rebuild it",
+    "graded":     "base on every alive link + full coded so any 2 links rebuild it",
+}
+
+
+def redundancy_plan(scheme, v, alive, base_level):
+    """Return the camera plan with redundancy applied. `alive` = Proposed's
+    chosen link first, then every other link the monitor reports alive.
+    With one alive link every scheme sends exactly what Proposed sends."""
+    n = len(alive)
+    if scheme == "none" or n < 2 or not v["links"] or v["level"] == 0:
+        return v
+    level = v["level"]
+    base = base_level if 0 < base_level < level else None   # a base as big as the full stream adds nothing
+    out = {"links": list(alive), "level": level}
+    if scheme == "full_copy":
+        return out                                           # plain copies (engine's original path)
+    if scheme == "base_copy":
+        if base is None:
+            return out
+        out["red"] = {"full_links": [alive[0]], "k": 1, "base": base, "base_links": alive[1:]}
+    elif scheme == "fec":
+        out["red"] = {"full_links": list(alive), "k": n - 1, "base": None, "base_links": []}
+    elif scheme == "two_stream":
+        # with two links "survive one loss" is a whole full copy on each, so a
+        # base stream would only add load; it is sent from three links up
+        k = n - 1
+        out["red"] = {"full_links": list(alive), "k": k, "base": base if k >= 2 else None,
+                      "base_links": list(alive) if k >= 2 else []}
+    elif scheme == "graded":
+        if base is None:                                     # full is already the minimum: plain copies
+            return out
+        out["red"] = {"full_links": list(alive), "k": 2, "base": base, "base_links": list(alive)}
+    else:
+        raise ValueError(f"unknown redundancy scheme {scheme!r}")
+    return out
+
+
+# ===================================================================
 # The module the main loop calls
 # ===================================================================
 # Part B thresholds, used if the config has no `uploads:` block; all (A)
@@ -274,7 +331,7 @@ class Proposed:
     name = "proposed"
     reject_stale = False
 
-    def __init__(self, cfg, features=None, upload_policy="adaptive"):
+    def __init__(self, cfg, features=None, upload_policy="adaptive", redundancy=None):
         self.cfg, self.p = cfg, cfg["proposed"]
         self.f = {"mission": True, "uploads": True, "predict": True, **(features or {})}
         self.upload_policy = upload_policy if self.f["uploads"] else "video_first"
@@ -283,6 +340,9 @@ class Proposed:
         self.pred = Predictor(cfg)
         self.alloc = Allocator(cfg, self.pred)
         self.links = [l["name"] for l in cfg["links"]]
+        self.redundancy = redundancy or cfg.get("redundancy", {}).get("scheme", "none")
+        if self.redundancy not in REDUNDANCY:
+            raise ValueError(f"unknown redundancy scheme {self.redundancy!r}")
 
     def _backup(self, now, links, cur, stream, req, kbps, margin):
         """Best other link for this stream: meets its limits now, is not itself
@@ -386,6 +446,15 @@ class Proposed:
                 else:
                     actions[cam] = "NORMAL"
             # commands are tiny: always on two links when two exist (as baseline)
+
+        # Feature 3: redundancy for the protected camera, on every alive link
+        if self.redundancy != "none":
+            for cam, n in needs.items():
+                if n["prio"] != 1 or not video[cam]["links"]:
+                    continue
+                first = video[cam]["links"][0]
+                alive = [first] + [l for l in self.links if l != first and links[l]["alive"]]
+                video[cam] = redundancy_plan(self.redundancy, video[cam], alive, n["levels"][0])
 
         # Part B, video-first / background case: bulk gets what is left after
         # the cameras, from the same budget and engine queue guard as always

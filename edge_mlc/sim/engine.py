@@ -72,7 +72,8 @@ class Sim:
 
         # video frame log: (latency_ms, capture_t, bulk_at_capture, cam, manoeuvre_at_capture)
         self.frames = []
-        self.arrivals = {c: deque() for c in ("front", "rear")}   # (arrival_t) last ~1 s per camera
+        self.arrivals = {c: deque() for c in ("front", "rear")}
+        self.shown = {c: {} for c in ("front", "rear")}              # capture time -> best level shown   # (arrival_t) last ~1 s per camera
         self.bulk_item = None                                     # id of the item being sent
 
         # plan state (v2: no graceful degradation, the speed cap is always 1.0)
@@ -146,8 +147,7 @@ class Sim:
             T = self.tr(ln)
             offered = TELEM_KBPS * (ln in self.cmd_links[:1])
             for c, vc in self.cam.items():
-                if ln in vc["links"]:
-                    offered += self.ladder[vc["level"]]["kbps"]
+                offered += self.cam_load(vc, ln)
             bulk_rate = 0.0
             if target is not None and bp["link"] == ln:
                 if bp.get("mode") == "greedy":    # TCP-like: fill the bottleneck and the buffer
@@ -230,6 +230,58 @@ class Sim:
         self.at(self.now + 0.2, self.report, ln)
 
     # ------------------------------------------------------------ video
+    def cam_load(self, vc, ln):
+        """kbps this camera's plan puts on link `ln`. Without redundancy: the
+        level's rate on every listed link (plain copies). With a redundancy
+        plan ("red", deciders/proposed.py): the full stream's 1/k share on each
+        full link plus the base stream on each base link."""
+        red = vc.get("red")
+        if not red:
+            return self.ladder[vc["level"]]["kbps"] if ln in vc["links"] else 0.0
+        kbps = 0.0
+        if ln in red["full_links"]:
+            kbps += self.ladder[vc["level"]]["kbps"] / red["k"]
+        if red["base"] and ln in red["base_links"]:
+            kbps += self.ladder[red["base"]]["kbps"]
+        return kbps
+
+    def camera_red(self, cam, v, lv):
+        """One captured frame under a redundancy plan (two-stream / FEC).
+        Full stream: erasure coded over the full links, any k of them rebuild
+        it; each link carries 1/k of the frame and arrives whole or not at all.
+        Base stream: the same capture at the base level's bit rate, whole on
+        every base link; first copy wins. The operator shows whichever arrives
+        first and upgrades to the full frame if it arrives later."""
+        red = v["red"]
+        frame_kbit = lv["kbps"] / lv["fps"]
+        arr_full = []
+        for ln in red["full_links"]:
+            share = frame_kbit / red["k"]
+            nfrag = max(1, math.ceil(share * 1000 / 8 / 1100))
+            T = self.tr(ln)
+            if self.lost(T, self.ovf[ln], nfrag):
+                continue
+            arr_full.append(self.now + (self.owd(T) + self.qdelay(ln, T) + HUB_TO_OP_MS) / 1000)
+        sent = frame_kbit / red["k"] * len(red["full_links"])
+        if len(arr_full) >= red["k"]:
+            t_full = sorted(arr_full)[red["k"] - 1]          # k-th piece completes the frame
+            self.at(t_full, self.frame_arrives, cam, self.now, v["level"], self.bulk_active, self.man)
+        if red["base"]:
+            bl = self.ladder[red["base"]]
+            bkbit = bl["kbps"] / lv["fps"]                   # same capture, base bit rate
+            nfrag = max(1, math.ceil(bkbit * 1000 / 8 / 1100))
+            best = None
+            for ln in red["base_links"]:
+                sent += bkbit
+                T = self.tr(ln)
+                if self.lost(T, self.ovf[ln], nfrag):
+                    continue
+                arr = self.now + (self.owd(T) + self.qdelay(ln, T) + HUB_TO_OP_MS) / 1000
+                best = arr if best is None else min(best, arr)
+            if best is not None:
+                self.at(best, self.frame_arrives, cam, self.now, red["base"], self.bulk_active, self.man)
+        self.kbit_dup += max(0.0, sent - frame_kbit)        # everything beyond one full copy
+
     def camera(self, cam, gen):
         if gen != self.cam_gen[cam]:
             return                                   # superseded by a newer target
@@ -237,6 +289,10 @@ class Sim:
         lv = self.ladder[v["level"]]
         if v["level"] == 0 or not v["links"]:
             return                                   # paused: woken again by the next target change
+        if v.get("red"):
+            self.camera_red(cam, v, lv)
+            self.at(self.now + 1 / lv["fps"], self.camera, cam, gen)
+            return
         nfrag = max(1, math.ceil(lv["kbps"] / lv["fps"] * 1000 / 8 / 1100))
         best = None
         for k, ln in enumerate(v["links"]):
@@ -252,9 +308,21 @@ class Sim:
         self.at(self.now + 1 / lv["fps"], self.camera, cam, gen)
 
     def frame_arrives(self, cam, t_cap, level, bulk, man):
+        # A capture counts once (frame rate), at its first arrival; a later,
+        # better copy of the same capture (two-stream: the full frame after the
+        # base) only upgrades what is shown. Without redundancy every capture
+        # arrives at most once, so this is the original behaviour.
+        seen = self.shown[cam]
+        prev = seen.get(t_cap)
+        if prev is not None and level <= prev:
+            return
+        seen[t_cap] = level
+        while len(seen) > 64:
+            seen.pop(next(iter(seen)))
         self.frames.append(((self.now - t_cap) * 1000.0, t_cap, bulk, cam, man))
-        self.arrivals[cam].append(self.now)
-        if t_cap > self.view[cam][0]:
+        if prev is None:
+            self.arrivals[cam].append(self.now)
+        if t_cap > self.view[cam][0] or (t_cap == self.view[cam][0] and level > self.view[cam][1]):
             self.view[cam] = (t_cap, level)
 
     # ------------------------------------------------------------ background recording
@@ -323,6 +391,8 @@ class Sim:
         self.plan = plan
         for c in self.cam:
             new = {"links": list(plan["video"][c]["links"]), "level": plan["video"][c]["level"]}
+            if plan["video"][c].get("red"):
+                new["red"] = plan["video"][c]["red"]           # redundancy plan (two-stream / FEC)
             if new != self.cam[c]:              # camera wakes at once on a new target (as video.py)
                 self.cam_gen[c] += 1
                 self.at(self.now, self.camera, c, self.cam_gen[c])
@@ -543,6 +613,7 @@ class Sim:
             lost_link_creep_s=self.creep_s,
             final_d_km=self.d, max_d_km=self.d_max,
             prot_level_mean=float(np.mean([r["level"] for r in R])),
+            full_level_pct=100 * float(np.mean([r["level"] >= 4 for r in R])),   # shown at 640x480
             interruptions=len(runs), longest_interruption_s=max(runs, default=0.0),
             useful_view_pct=100 * useful,
             live_view_pct=100 * live,
